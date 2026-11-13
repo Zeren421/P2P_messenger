@@ -84,14 +84,18 @@ class ClipboardHelper:
 
     def _send_pixmap(self, pixmap: QPixmap) -> None:
         """Convert QPixmap to bytes and send via callback."""
+        from datetime import datetime
+
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.WriteOnly)
         pixmap.save(buf, "PNG")
         buf.close()
-        self.send_image_bytes_callback(bytes(ba), "Скриншот.png")
+        filename = f"Screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        self.send_image_bytes_callback(bytes(ba), filename)
 
     def _send_qimage(self, image: QImage) -> None:
         """Convert QImage to bytes and send via callback."""
         pixmap = QPixmap.fromImage(image)
         self._send_pixmap(pixmap)
+

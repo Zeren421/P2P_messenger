@@ -22,13 +22,11 @@ class FileSenderHelper:
         parent_widget: QWidget,
         send_file_callback: Callable[[str, str, Optional[bytes]], int],
         add_bubble_callback: Callable[[object, bool], None],
-        progress_callback: Callable[[int, float], None],
         file_filter: str = "All files (*.*);;Images (*.png *.jpg *.jpeg *.gif *.bmp);;Documents (*.pdf *.doc *.txt)",
     ):
         self.parent_widget = parent_widget
         self.send_file_callback = send_file_callback
         self.add_bubble_callback = add_bubble_callback
-        self.progress_callback = progress_callback
         self.file_filter = file_filter
         self.active_bubbles = {}
 

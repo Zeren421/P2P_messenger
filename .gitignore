@@ -6,3 +6,8 @@ __pycache__/
 venv/
 *.spec
 *.log
+*.log
+p2p_log.txt
+history.jsonl
+username.txt
+peer.txt

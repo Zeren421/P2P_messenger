@@ -182,7 +182,7 @@ class ConnectionManager:
     # ==========================================================
     # НОВЫЙ МЕТОД ДЛЯ ОТПРАВКИ ИЗОБРАЖЕНИЙ ПРЯМО ИЗ БАЙТОВ
     # ==========================================================
-    def send_image_bytes(self, image_bytes: bytes, caption: str = "") -> int:
+    def send_image_bytes(self, image_bytes: bytes, filename: str = "Скриншот.png", caption: str = "") -> int:
         """
         Отправляет изображение напрямую из оперативной памяти без создания временного файла.
         Возвращает file_id для отслеживания прогресса.
@@ -201,7 +201,7 @@ class ConnectionManager:
         # Используем встроенную возможность менеджера файлов работать с памятью
         return self._file_manager.send_memory_file(
             data=image_bytes,
-            filename="Скриншот.png",
+            filename=filename,
             caption=caption,
             thumbnail=None
         )

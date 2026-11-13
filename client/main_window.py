@@ -64,6 +64,9 @@ class ChatClient(QMainWindow):
     file_progress_signal = pyqtSignal(int, float, bool)
     file_error_signal = pyqtSignal(int, str)
     file_info_signal = pyqtSignal(int, str, int, bytes, str)
+    # НОВЫЕ СИГНАЛЫ (для потокобезопасности):
+    message_failed_signal = pyqtSignal(str)
+    file_received_signal = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -313,7 +316,6 @@ class ChatClient(QMainWindow):
             parent_widget=self,
             send_file_callback=self._send_file_impl,
             add_bubble_callback=self._add_file_bubble_to_chat,
-            progress_callback=self.file_progress_signal.emit
         )
         self.clipboard_helper = ClipboardHelper(
             send_file_callback=self.file_sender.send_file_from_path,
@@ -331,6 +333,9 @@ class ChatClient(QMainWindow):
         self.file_progress_signal.connect(self._on_file_progress_gui)
         self.file_error_signal.connect(self._on_file_error_gui)
         self.file_info_signal.connect(self._on_file_info)
+        # ПОДКЛЮЧАЕМ НОВЫЕ СИГНАЛЫ:
+        self.message_failed_signal.connect(self._on_message_failed_gui)
+        self.file_received_signal.connect(self._on_file_received_gui)
         log.info("init_signals finished")
 
     # ============================================================
@@ -435,7 +440,12 @@ class ChatClient(QMainWindow):
         self.typing_signal.emit(is_typing, sender_name or self.peer_name)
 
     def _on_message_failed(self, text):
+        """Колбэк от ConnectionManager (фоновый поток). Только эмитит сигнал."""
         log.warning(f"_on_message_failed: {text}")
+        self.message_failed_signal.emit(text)
+
+    def _on_message_failed_gui(self, text):
+        """Слот (GUI-поток). Показывает системное сообщение."""
         self.add_system_message(f"Не удалось доставить: «{text}»")
 
     def _on_status(self, message):
@@ -492,9 +502,13 @@ class ChatClient(QMainWindow):
         self.password_retry_signal.emit(attempts_left)
 
     def _on_file_received(self, file_id, filename, save_path):
+        """Колбэк от ConnectionManager (фоновый поток). Только эмитит сигнал."""
         log.info(f"_on_file_received: {filename} -> {save_path}")
+        self.file_received_signal.emit(file_id, filename, save_path)
+
+    def _on_file_received_gui(self, file_id, filename, save_path):
+        """Слот (GUI-поток). Показывает сообщение и обновляет bubble."""
         self.add_system_message(f"📥 Получен файл: {filename} (сохранён в {save_path})")
-        # Устанавливаем путь в бабле, если он уже создан
         bubble = self.active_file_bubbles.get(file_id)
         if bubble:
             bubble.set_file_path(save_path)
@@ -751,14 +765,10 @@ class ChatClient(QMainWindow):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-
     def dropEvent(self, event):
         urls = event.mimeData().urls()
         if urls:
-            for url in urls:
-                path = url.toLocalFile()
-                if path and os.path.isfile(path):
-                    self.file_sender.send_file_from_path(path)
+            self.file_sender.handle_drop(urls)
             event.acceptProposedAction()
 
     def eventFilter(self, obj, event):
@@ -835,7 +845,7 @@ class ChatClient(QMainWindow):
                 item = self.chat_layout.takeAt(0)
                 if item.widget():
                     item.widget().deleteLater()
-            self.last_date = ""
+            self.message_renderer.reset() 
             self.user_colors = {}
             clear_history()
             self.add_system_message("Чат очищен")

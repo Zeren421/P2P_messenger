@@ -16,7 +16,8 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPainter, QColor, QFont, QBrush, QPen, QPixmap, QImage
 from PyQt5.QtWidgets import (
     QFrame, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
-    QProgressBar, QFileDialog, QMessageBox, QGraphicsDropShadowEffect
+    QProgressBar, QFileDialog, QMessageBox, QGraphicsDropShadowEffect,
+    QWidget
 )
 from PIL import Image, ImageFilter
 

@@ -13,6 +13,9 @@ class MessageRenderer:
     """
     Handles adding message bubbles, date separators, and alignment.
     """
+    def reset(self) -> None:
+        """Сбрасывает состояние рендерера (например, после очистки чата)."""
+        self._last_date = None
 
     def __init__(self, chat_layout):
         self.chat_layout = chat_layout
