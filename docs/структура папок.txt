@@ -1,0 +1,78 @@
+📁 P2P_Messenger/                          # Корень проекта
+│
+├── 📁 client/                            # Клиентская часть (основной код)
+│   │
+│   ├── 📄 p2p_chat_client.py             # Точка входа: только main() + QApplication
+│   │
+│   ├── 📄 main_window.py                 # Главное окно ChatClient (QMainWindow)
+│   │                                     # Собирает хелперы и виджеты, содержит сетевую логику
+│   │
+│   ├── 📄 connection_manager.py          # Управление соединением: UDP, Relay, ACK, шифрование
+│   │
+│   ├── 📄 file_transfer.py               # Передача файлов: скользящее окно, чанки, битмап
+│   │
+│   ├── 📄 protocol.py                    # Бинарный протокол: пакеты, криптография (X25519, AES-GCM)
+│   │
+│   ├── 📄 relay_transport.py             # Relay через ntfy.sh (fallback)
+│   │
+│   ├── 📄 stun_client.py                 # STUN-клиент для определения внешнего IP
+│   │
+│   ├── 📄 transport.py                   # Абстрактный интерфейс транспорта (ITransport)
+│   │
+│   ├── 📄 udp_transport.py               # UDP-транспорт: hole punching, NAT-детектор
+│   │
+│   ├── 📁 helpers/                       # Вспомогательные модули (чистая логика)
+│   │   │
+│   │   ├── 📄 __init__.py                # Экспорт всех хелперов
+│   │   │
+│   │   ├── 📄 ui_utils.py                # Утилиты: цвета, resource_path, darken_color
+│   │   │
+│   │   ├── 📄 history.py                 # История: сохранение/загрузка, username, peer (папка data/)
+│   │   │
+│   │   ├── 📄 render.py                  # Отрисовка чата: MessageRenderer, ScrollManager
+│   │   │
+│   │   ├── 📄 clipboard.py               # Буфер обмена: вставка скриншотов через QBuffer
+│   │   │
+│   │   └── 📄 file_sender.py             # Отправка файлов: диалог, drag&drop, прогресс
+│   │
+│   └── 📁 widgets/                       # UI-компоненты (виджеты)
+│       │
+│       ├── 📄 __init__.py                # Экспорт всех виджетов
+│       │
+│       ├── 📄 bubbles.py                 # MessageBubble (текст) и FileBubble (файлы)
+│       │
+│       ├── 📄 indicators.py              # TypingIndicator и CircularProgressIndicator
+│       │
+│       └── 📄 image_viewer.py            # Просмотрщик изображений (с зумом)
+│
+├── 📁 data/                              # Пользовательские данные (создаётся автоматически)
+│   │
+│   ├── 📄 history.jsonl                  # История сообщений (JSON Lines)
+│   ├── 📄 username.txt                   # Имя пользователя
+│   └── 📄 peer.txt                       # Имя собеседника
+│
+├── 📁 docs/                              # Документация проекта
+│   │
+│   ├── 📄 README.md                      # Описание проекта, установка, запуск
+│   ├── 📄 roadmap.md                     # Дорожная карта (v6.6)
+│   └── 📄 STRUCTURE.md                   # Структура проекта (этот файл)
+│
+├── 📁 server/                            # Серверная часть (опционально)
+│   │
+│   ├── 📄 ChatServer.cpp                 # C++ TCP-сервер (старая версия)
+│   ├── 📄 UDP_Chat_Server.cpp            # C++ UDP-сервер (старая версия)
+│   │
+│   └── 📁 relay/                         # Relay-серверы
+│       └── 📄 ntfy_server.py             # Локальный ntfy-клон (Python)
+│
+├── 📁 resources/                         # Статические ресурсы
+│   │
+│   ├── 📄 din-don.wav                    # Звук уведомления
+│   └── 📄 icon.ico                       # Иконка для EXE (опционально)
+│
+├── 📁 tests/                             # Тесты (опционально, пока пусто)
+│   └── ...
+│
+├── 📄 requirements.txt                   # Зависимости Python
+├── 📄 .gitignore                         # Игнорируемые файлы для Git
+└── 📄 README.md                          # Главный README (в корне)
