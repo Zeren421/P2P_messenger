@@ -9,6 +9,7 @@ import os
 import platform
 import subprocess
 import shutil
+import time
 from datetime import datetime
 from io import BytesIO
 
@@ -105,6 +106,7 @@ class MessageBubble(QFrame):
         self.setGraphicsEffect(shadow)
         self.setMaximumWidth(720)
 
+
 # ============================================================
 #  FILE BUBBLE
 # ============================================================
@@ -128,6 +130,10 @@ class FileBubble(QFrame):
         self.file_path = ""
         self._interactable = False
         self.image_bytes = b''
+        
+        # Для ETA и скорости
+        self._start_time = None
+        self._on_cancel_callback = None
 
         self.thumbnail_bytes = thumbnail if thumbnail is not None else b''
         self.original_bytes = original_bytes if original_bytes is not None else b''
@@ -274,6 +280,29 @@ class FileBubble(QFrame):
             actions.addWidget(save_btn)
             layout.addLayout(actions)
 
+        # --- ETA и скорость ---
+        self._eta_label = QLabel()
+        self._eta_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self._eta_label.hide()
+        layout.addWidget(self._eta_label)
+
+        # --- Кнопка отмены ---
+        self._cancel_btn = QPushButton("✕ Отменить")
+        self._cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #ff6b6b;
+                border: 1px solid #ff6b6b;
+                border-radius: 6px;
+                font-size: 11px;
+                padding: 2px 8px;
+            }
+            QPushButton:hover { background-color: #ff6b6b; color: #000000; }
+        """)
+        self._cancel_btn.hide()
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        layout.addWidget(self._cancel_btn)
+
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(22)
         shadow.setOffset(0, 4)
@@ -353,8 +382,12 @@ class FileBubble(QFrame):
     def update_progress(self, ratio):
         if self._completed:
             return
+        
         percent = int(ratio * 100)
+        
         if self.is_image:
+            if hasattr(self, 'progress_indicator'):
+                self.progress_indicator.set_progress(ratio)
             if percent >= 100:
                 self._progress_complete = True
                 if self.is_own and not self.thumbnail_clear.isNull():
@@ -368,8 +401,37 @@ class FileBubble(QFrame):
                 self._completed = True
                 self._interactable = True
                 self.setCursor(Qt.PointingHandCursor)
+                self._cancel_btn.hide()
+                self._eta_label.hide()
+                return
+
+        # Показываем кнопку отмены только пока передача идет
+        if not self._completed:
+            self._cancel_btn.show()
+            
+            # --- Расчет ETA и скорости ---
+            if self._start_time is None:
+                self._start_time = time.time()
+            else:
+                elapsed = time.time() - self._start_time
+                if elapsed > 0.5 and ratio > 0:
+                    bytes_done = int(ratio * self.file_size)
+                    speed_bps = bytes_done / elapsed
+                    remaining_bytes = self.file_size - bytes_done
+                    eta_seconds = remaining_bytes / speed_bps if speed_bps > 0 else 0
+
+                    kb_s = speed_bps / 1024
+                    if eta_seconds < 60:
+                        eta_str = f"{int(eta_seconds)} сек"
+                    else:
+                        eta_str = f"{int(eta_seconds / 60)} мин"
+
+                    self._eta_label.setText(f"{kb_s:.0f} KB/s · осталось {eta_str}")
+                    self._eta_label.show()
 
     def set_progress_done(self):
+        self._cancel_btn.hide()
+        self._eta_label.hide()
         if self.is_image:
             if hasattr(self, 'progress_indicator'):
                 self.progress_indicator.stop()
@@ -387,6 +449,19 @@ class FileBubble(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         if self.is_image:
             self.click_hint.show()
+
+    def _on_cancel_clicked(self):
+        if self._on_cancel_callback:
+            self._on_cancel_callback(self.file_id)
+        self._cancel_btn.hide()
+        self._eta_label.setText("Отменено")
+        self._eta_label.show()
+        if not self.is_image:
+            self.progress_bar.setValue(0)
+            self.progress_bar.hide()
+
+    def set_cancel_callback(self, callback):
+        self._on_cancel_callback = callback
 
     # --- Interaction ---
 

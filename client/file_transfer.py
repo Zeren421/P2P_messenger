@@ -16,13 +16,13 @@ from protocol import (
     pack_file_chunk_ack_bitmap, unpack_file_chunk_ack_bitmap, PacketType
 )
 
-CHUNK_SIZE = 1200
+CHUNK_SIZE = 1000
 
 INITIAL_WINDOW_SIZE = 32
 MAX_WINDOW_SIZE = 512
 MIN_WINDOW_SIZE = 8
 
-MAX_CHUNK_ATTEMPTS = 10
+MAX_CHUNK_ATTEMPTS = 50
 MAX_CONCURRENT_TRANSFERS = 1
 
 class FileTransferError(Exception):
@@ -163,7 +163,7 @@ class SendingFile:
 
     def resend_timeout(self) -> float:
         if not self.rtt_samples:
-            return 0.3
+            return 0.8
         recent = self.rtt_samples[-5:]
         avg_rtt = sum(recent) / len(recent)
         return max(0.05, min(1.0, avg_rtt * 2.0))
@@ -472,11 +472,16 @@ class FileTransferManager:
                 self._on_file_error(file_id, f"Write error: {e}")
             return
 
-        # Отправляем кумулятивный ACK, если накопилось 64 чанка или это последний
-        self._send_bitmap_ack_if_needed(file_id)
+        # Отправляем ACK на каждый чанк (или можно оставить битмап, но чаще)
+        self._send_chunk_ack(file_id, chunk_seq)
 
         if self._on_progress is not None:
-            ratio = len(incoming.received_chunks) / incoming.total_chunks
+            # Считаем прогресс по БАЙТАМ, а не по штукам чанков. 
+            # Это даёт плавное обновление даже для огромных файлов.
+            received_bytes = len(incoming.received_chunks) * CHUNK_SIZE
+            if received_bytes > incoming.total_size:
+                received_bytes = incoming.total_size
+            ratio = received_bytes / incoming.total_size
             self._on_progress(file_id, ratio, False)
 
         if incoming.is_complete():
@@ -564,7 +569,30 @@ class FileTransferManager:
         if self._on_progress is not None:
             self._on_progress(incoming.file_id, 1.0, False)
 
+    def _send_chunk(self, sending: SendingFile, chunk_meta: OutgoingChunkMeta) -> None:
+        offset = chunk_meta.chunk_seq * CHUNK_SIZE
+        try:
+            sending.file_handle.seek(offset)
+            data = sending.file_handle.read(CHUNK_SIZE)
+        except Exception as e:
+            if self._on_file_error is not None:
+                self._on_file_error(sending.file_id, f"Read error: {e}")
+            return
+
+        seq = self._next_seq()
+        encrypted = self._encrypt(data, seq)
+        header = sending.file_id.to_bytes(4, "big") + chunk_meta.chunk_seq.to_bytes(2, "big")
+        payload = header + encrypted
+        
+        # ВОТ ЗДЕСЬ: проверяем, ушел ли пакет
+        if not self._send_raw(pack_file_chunk(seq, payload)):
+            # Если не ушел, не увеличиваем счетчик попыток, попробуем позже
+            return
+
+        chunk_meta.sent_at = time.time()
+        chunk_meta.attempts += 1
     def _send_chunk_ack(self, file_id: int, chunk_seq: int) -> None:
+        """Отправляет ACK на конкретный полученный чанк."""
         seq = self._next_seq()
         self._send_raw(pack_file_chunk_ack(seq, file_id, chunk_seq))
 

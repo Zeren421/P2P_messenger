@@ -76,7 +76,13 @@ class FileSenderHelper:
             parent=self.parent_widget,
             original_bytes=original_bytes,
         )
+        
         self.active_bubbles[file_id] = bubble
+        
+        # Передаем колбэк отмены из главного окна (main_window)
+        if hasattr(self.parent_widget, "_on_file_cancel"):
+            bubble.set_cancel_callback(self.parent_widget._on_file_cancel)
+            
         self.add_bubble_callback(bubble, is_own=True)
 
         QTimer.singleShot(50, lambda fid=file_id, fp=filepath: self._set_bubble_path(fid, fp))

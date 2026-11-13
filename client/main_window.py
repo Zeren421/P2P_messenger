@@ -544,10 +544,8 @@ class ChatClient(QMainWindow):
         QMessageBox.warning(self, "Пароль", f"Неверный пароль. Осталось попыток: {attempts_left}")
 
     def _on_file_progress_gui(self, file_id, ratio, is_outgoing):
-        """
-        Слот для обновления прогресса файла (GUI-поток).
-        """
         log.debug(f"_on_file_progress_gui: file_id={file_id}, ratio={ratio:.2f}")
+
         bubble = self.active_file_bubbles.get(file_id)
         if bubble:
             bubble.update_progress(ratio)
@@ -576,6 +574,7 @@ class ChatClient(QMainWindow):
             original_bytes=None
         )
         self.active_file_bubbles[file_id] = bubble
+        bubble.set_cancel_callback(self._on_file_cancel)  # <-- ДОБАВЛЕНО ПРАВИЛЬНО
         self._add_file_bubble_to_chat(bubble, is_own=False)
         self.play_notification_sound()
         if not self.isActiveWindow():
@@ -765,6 +764,7 @@ class ChatClient(QMainWindow):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            
     def dropEvent(self, event):
         urls = event.mimeData().urls()
         if urls:
@@ -831,6 +831,13 @@ class ChatClient(QMainWindow):
             self.tray_icon.showMessage(f"✉️ {sender}", preview, QSystemTrayIcon.Information, 3000)
         except:
             pass
+
+    def _on_file_cancel(self, file_id: int):
+        """Вызывается, когда пользователь жмет «Отменить» в FileBubble."""
+        log.info(f"_on_file_cancel: file_id={file_id}")
+        if self.conn_manager and self.conn_manager._file_manager:
+            self.conn_manager._file_manager.cancel_send(file_id)
+        self.add_system_message(f"❌ Передача файла отменена")
 
     def clear_chat(self):
         log.info("clear_chat called")
