@@ -29,6 +29,24 @@ from .indicators import CircularProgressIndicator
 #  MESSAGE BUBBLE
 # ============================================================
 
+def format_size(size_bytes: int) -> str:
+    """Форматирует байты в читаемый вид (B, KB, MB, GB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+def format_speed(bytes_per_sec: float) -> str:
+    """Форматирует скорость в читаемый вид (KB/s, MB/s)."""
+    if bytes_per_sec < 1024 * 1024:
+        return f"{bytes_per_sec / 1024:.0f} KB/s"
+    else:
+        return f"{bytes_per_sec / (1024 * 1024):.1f} MB/s"
+
 class MessageBubble(QFrame):
     def __init__(self, sender, text, time_str, is_own=False, is_system=False, color=None, parent=None):
         super().__init__(parent)
@@ -208,7 +226,7 @@ class FileBubble(QFrame):
             container_layout.addWidget(self.progress_indicator, alignment=Qt.AlignCenter)
             self.preview_layout.addWidget(container)
 
-            self.info_label = QLabel(f"🖼️ {file_size//1024} KB")
+            self.info_label = QLabel(f"🖼️ {format_size(file_size)}")
             self.info_label.setStyleSheet(f"color: {text_color}; font-size: 11px;")
             self.info_label.hide()
             layout.addWidget(self.preview_container)
@@ -226,7 +244,7 @@ class FileBubble(QFrame):
             icon_label.setAlignment(Qt.AlignCenter)
             self.preview_layout.addWidget(icon_label)
 
-            info = QLabel(f"{filename} · {file_size//1024} KB")
+            info = QLabel(f"{filename} · {format_size(file_size)}")
             info.setStyleSheet(f"color: {text_color}; font-size: 13px;")
             self.preview_layout.addWidget(info)
 
@@ -409,16 +427,10 @@ class FileBubble(QFrame):
         if not self._completed:
             self._cancel_btn.show()
             
-            # --- ДОБАВИТЬ СБРОС ТЕКСТА ОЧЕРЕДИ ---
-            if self._start_time is None:
-                self._eta_label.setText("") 
-            
-            if self._start_time is None:
-                self._start_time = time.time()
-
             # --- Расчет ETA и скорости ---
             if self._start_time is None:
                 self._start_time = time.time()
+                self._eta_label.setText("")  # Сбрасываем плашку "В очереди"
             else:
                 elapsed = time.time() - self._start_time
                 if elapsed > 0.5 and ratio > 0:
@@ -427,13 +439,14 @@ class FileBubble(QFrame):
                     remaining_bytes = self.file_size - bytes_done
                     eta_seconds = remaining_bytes / speed_bps if speed_bps > 0 else 0
 
-                    kb_s = speed_bps / 1024
+                    speed_str = format_speed(speed_bps)
+                    
                     if eta_seconds < 60:
                         eta_str = f"{int(eta_seconds)} сек"
                     else:
                         eta_str = f"{int(eta_seconds / 60)} мин"
 
-                    self._eta_label.setText(f"{kb_s:.0f} KB/s · осталось {eta_str}")
+                    self._eta_label.setText(f"{speed_str} · осталось {eta_str}")
                     self._eta_label.show()
 
     def set_queued(self):

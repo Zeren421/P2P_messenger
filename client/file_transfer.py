@@ -198,7 +198,7 @@ class FileTransferManager:
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
         on_file_cancelled: Optional[Callable[[int, bool], None]] = None,
-        on_file_queued: Optional[Callable[[int, str], None]] = None, # НОВЫЙ КОЛБЭК
+        on_file_queued: Optional[Callable[[int, str], None]] = None,
         downloads_dir: str = ".",
     ) -> None:
         self._send_raw = send_raw
@@ -482,7 +482,6 @@ class FileTransferManager:
             self._finish_incoming(incoming)
 
     def handle_file_chunk_ack_packet(self, file_id: int, cumulative_ack: int) -> None:
-        # ФИКС 4: Убран блок if cumulative_ack == ACK_NOTHING
         with self._lock:
             sending = self._outgoing.get(file_id)
             if sending is None or sending.cancelled: return
@@ -543,7 +542,7 @@ class FileTransferManager:
             if sending is not None:
                 sending.close_file()
                 self._outgoing.pop(file_id, None)
-        self._try_start_next_queued() # ФИКС 5
+        self._try_start_next_queued()
 
     @staticmethod
     def _update_rtt(sending: SendingFile, sample: float) -> None:
@@ -585,7 +584,6 @@ class FileTransferManager:
             except Exception: pass
 
     def _send_ack(self, incoming: ReceivingFile) -> None:
-        # ФИКС 4: Не шлём ACK, если ничего не получили
         if incoming.next_write_chunk == 0:
             return
         seq = self._next_seq()
@@ -640,24 +638,36 @@ class FileTransferManager:
                 file_ids = list(self._outgoing.keys())
 
             for file_id in file_ids:
+                freed_slot = False  # <--- НОВЫЙ ФЛАГ
                 with self._lock:
                     sending = self._outgoing.get(file_id)
-                    if sending is None or sending.cancelled or not sending.file_info_acked: continue
+                    if sending is None or sending.cancelled or not sending.file_info_acked: 
+                        continue
+                        
                     rto = self._current_rto(sending)
 
                     for meta in list(sending.inflight.values()):
-                        if now - meta.last_sent_at < rto: continue
+                        if now - meta.last_sent_at < rto: 
+                            continue
+                            
                         if meta.attempts >= MAX_CHUNK_ATTEMPTS:
                             self._outgoing.pop(file_id, None)
                             sending.close_file()
                             if self._on_file_error:
                                 try: self._on_file_error(file_id, "Chunk delivery failed (max attempts)")
                                 except Exception: pass
+                            freed_slot = True  # <--- ФИКС 1: Освободился слот
                             break
+                            
                         meta.attempts += 1
                         meta.retransmitted = True
                         self._send_chunk_data(sending, meta.chunk_seq, meta)
                         sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
                         sending.ssthresh = sending.window_bytes
                         sending.in_slow_start = False
+                
+                # Вызываем запуск очереди ВНЕ блока с lock, чтобы избежать дедлока
+                if freed_slot:
+                    self._try_start_next_queued()  # <--- ФИКС 1
+                    
                 self._kick_window(file_id)
