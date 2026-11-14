@@ -53,6 +53,7 @@ class PacketType(IntEnum):
     FILE_CHUNK_ACK = 0x12
     FILE_DONE = 0x13
     FILE_CHUNK_ACK_BITMAP = 0x14   # НОВЫЙ ТИП ДЛЯ КУМУЛЯТИВНЫХ ACK
+    FILE_CANCEL = 0x15
 
 class ProtocolError(Exception):
     """Некорректный или повреждённый пакет."""
@@ -229,7 +230,8 @@ def pack_file_chunk(seq: int, payload: bytes) -> bytes:
     return pack(PacketType.FILE_CHUNK, seq, payload)
 
 def pack_file_chunk_ack(seq: int, file_id: int, chunk_seq: int) -> bytes:
-    payload = file_id.to_bytes(4, 'big') + chunk_seq.to_bytes(2, 'big')
+    # chunk_seq теперь CUMULATIVE ACK (4 байта вместо 2)
+    payload = file_id.to_bytes(4, 'big') + chunk_seq.to_bytes(4, 'big')
     return pack(PacketType.FILE_CHUNK_ACK, seq, payload)
 
 def pack_file_chunk_ack_bitmap(seq: int, file_id: int, base_seq: int, bitmap: int) -> bytes:
@@ -251,3 +253,13 @@ def unpack_file_chunk_ack_bitmap(payload: bytes) -> tuple[int, int, int]:
 def pack_file_done(seq: int, file_id: int) -> bytes:
     payload = file_id.to_bytes(4, 'big')
     return pack(PacketType.FILE_DONE, seq, payload)
+def pack_file_cancel(seq: int, file_id: int, by_sender: bool) -> bytes:
+    payload = file_id.to_bytes(4, "big") + bytes([1 if by_sender else 0])
+    return pack(PacketType.FILE_CANCEL, seq, payload)
+
+def unpack_file_cancel(packet: Packet) -> tuple[int, bool]:
+    if packet.type != PacketType.FILE_CANCEL:
+        raise ProtocolError("Not a FILE_CANCEL packet")
+    if len(packet.payload) != 5:
+        raise ProtocolError("Malformed FILE_CANCEL payload")
+    return int.from_bytes(packet.payload[:4], "big"), packet.payload[4] == 1

@@ -1,5 +1,14 @@
 """
-ConnectionManager — улучшенная версия с поддержкой отправки байтов (для скриншотов)
+ConnectionManager — с надёжной доставкой FILE_INFO, FILE_CANCEL, chunk_seq=4 байта.
+
+Фикс (баг №2):
+  * send_file / send_image_bytes кидают понятную ошибку, если транспорт —
+    не UDP. Relay (ntfy.sh) не тянет файлы: один POST на чанк + rate-limit 429.
+
+Фикс (баг №3):
+  * _handle_file_chunk_ack_bitmap теперь no-op: v2 file_transfer использует
+    кумулятивный ACK, bitmap не поддерживает. Заглушка на случай старого
+    клиента на другой стороне (раньше был AttributeError).
 """
 
 from __future__ import annotations
@@ -22,11 +31,13 @@ from protocol import (
     unpack, unpack_ack_target, unpack_name, unpack_pubkey,
     unpack_password, unpack_password_accept, unpack_password_reject,
     unpack_text, unpack_typing, unpack_file_chunk_ack_bitmap,
+    unpack_file_cancel, pack_file_cancel, pack_file_info,
 )
 from transport import ITransport
 from udp_transport import UdpTransport
 from relay_transport import RelayTransport
 from file_transfer import FileTransferManager
+
 
 @dataclass(slots=True)
 class PendingEntry:
@@ -35,6 +46,7 @@ class PendingEntry:
     text: str
     sent_at: float
     attempts: int
+
 
 class ConnectionManager:
     def __init__(
@@ -73,6 +85,7 @@ class ConnectionManager:
         self._next_seq_value = 1
         self._pending_lock = threading.Lock()
         self._pending: Dict[int, PendingEntry] = {}
+        self._file_info_callbacks: Dict[int, tuple] = {}
         self._dedup_lock = threading.Lock()
         self._seen_seqs: Deque[int] = deque(maxlen=DEDUP_WINDOW)
         self._seen_seqs_set: Set[int] = set()
@@ -148,6 +161,7 @@ class ConnectionManager:
             encrypt=lambda data, seq: self._crypto.encrypt(data, seq) if self._crypto else None,
             decrypt=lambda data, seq: self._crypto.decrypt(data, seq) if self._crypto else None,
             next_seq=self._next_seq,
+            send_reliable_file_info=self.send_file_info_reliable,
             on_progress=self._on_file_progress,
             on_file_received=self._on_file_received,
             on_file_error=self._on_file_error,
@@ -167,6 +181,7 @@ class ConnectionManager:
             self._transport = None
         with self._pending_lock:
             self._pending.clear()
+            self._file_info_callbacks.clear()
         self._key_exchanged = False
         self._pending_messages.clear()
         if self._file_manager is not None:
@@ -180,31 +195,47 @@ class ConnectionManager:
         self._ping_missed = 0
 
     # ==========================================================
-    # НОВЫЙ МЕТОД ДЛЯ ОТПРАВКИ ИЗОБРАЖЕНИЙ ПРЯМО ИЗ БАЙТОВ
+    # Публичное API
     # ==========================================================
-    def send_image_bytes(self, image_bytes: bytes, filename: str = "Скриншот.png", caption: str = "") -> int:
-        """
-        Отправляет изображение напрямую из оперативной памяти без создания временного файла.
-        Возвращает file_id для отслеживания прогресса.
-        """
+
+    def _require_udp_for_files(self) -> None:
+        """Общий guard для файловых методов."""
+        if not isinstance(self._transport, UdpTransport):
+            raise Exception(
+                "Передача файлов доступна только через прямое P2P-соединение (UDP). "
+                "Текущий транспорт — relay (ntfy), он не предназначен для файлов. "
+                "Попробуйте переподключиться, чтобы установить прямое соединение."
+            )
+
+    def send_image_bytes(self, image_bytes: bytes, filename: str = "Скриншот.png",
+                         caption: str = "") -> int:
         if self._file_manager is None:
             raise Exception("Connection not established")
-        
-        # Разрешаем отправку даже через Relay (ранее было только UDP)
-        # Это нужно, если hole-punching не сработал, но хочется отправить хотя бы превью
-        # if not isinstance(self._transport, UdpTransport):
-        #     raise Exception("File transfer only available over UDP")
-            
         if self._crypto is None or not self._key_exchanged or not self._password_verified:
             raise Exception("Encryption not ready")
-
-        # Используем встроенную возможность менеджера файлов работать с памятью
+        # ← ФИКС БАГА №2
+        self._require_udp_for_files()
         return self._file_manager.send_memory_file(
-            data=image_bytes,
-            filename=filename,
-            caption=caption,
-            thumbnail=None
+            data=image_bytes, filename=filename, caption=caption, thumbnail=None,
         )
+
+    def send_file(self, filepath: str, caption: str = "",
+                  thumbnail: Optional[bytes] = None) -> int:
+        if self._file_manager is None:
+            raise Exception("Connection not established")
+        if self._crypto is None or not self._key_exchanged or not self._password_verified:
+            raise Exception("Encryption not ready")
+        # ← ФИКС БАГА №2
+        self._require_udp_for_files()
+        return self._file_manager.send_file(filepath, caption, thumbnail)
+
+    def cancel_file(self, file_id: int, is_outgoing: bool = True) -> None:
+        if self._file_manager is None:
+            return
+        if is_outgoing:
+            self._file_manager.cancel_send(file_id)
+        else:
+            self._file_manager.cancel_receive(file_id)
 
     def send_message(self, text: str) -> None:
         if self._crypto is None or not self._key_exchanged:
@@ -217,7 +248,6 @@ class ConnectionManager:
         seq = self._next_seq()
         encrypted = self._crypto.encrypt(text.encode(), seq)
         data = pack(PacketType.MSG, seq, encrypted)
-
         with self._pending_lock:
             self._pending[seq] = PendingEntry("msg", data, text, time.time(), 1)
         self._send_raw(data)
@@ -264,18 +294,26 @@ class ConnectionManager:
     def is_connected(self) -> bool:
         return self._transport is not None and self._transport.is_alive()
 
-    # Измененный старый метод: убрано жесткое ограничение "только UDP"
-    def send_file(self, filepath: str, caption: str = "", thumbnail: Optional[bytes] = None) -> int:
-        if self._file_manager is None:
-            raise Exception("Connection not established")
-        
-        # Теперь можно отправлять файлы и через Relay, если прямой канал недоступен
-        # if not isinstance(self._transport, UdpTransport):
-        #     raise Exception("File transfer only available over UDP")
-            
-        if self._crypto is None or not self._key_exchanged or not self._password_verified:
+    # ==========================================================
+    # Надёжный FILE_INFO
+    # ==========================================================
+
+    def send_file_info_reliable(self, file_id: int, info_plaintext: bytes,
+                                on_ack: Callable[[], None],
+                                on_fail: Callable[[], None]) -> None:
+        if self._crypto is None or not self._key_exchanged:
             raise Exception("Encryption not ready")
-        return self._file_manager.send_file(filepath, caption, thumbnail)
+        seq = self._next_seq()
+        encrypted = self._crypto.encrypt(info_plaintext, seq)
+        data = pack_file_info(seq, encrypted)
+        with self._pending_lock:
+            self._pending[seq] = PendingEntry("file_info", data, "", time.time(), 1)
+            self._file_info_callbacks[seq] = (on_ack, on_fail)
+        self._send_raw(data)
+
+    # ==========================================================
+    # Служебное
+    # ==========================================================
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -293,6 +331,10 @@ class ConnectionManager:
                 self._on_status(msg)
             except Exception:
                 pass
+
+    # ==========================================================
+    # Dispatch
+    # ==========================================================
 
     def _on_raw_received(self, data: bytes) -> None:
         try:
@@ -318,11 +360,16 @@ class ConnectionManager:
             PacketType.FILE_CHUNK_ACK: self._handle_file_chunk_ack,
             PacketType.FILE_CHUNK_ACK_BITMAP: self._handle_file_chunk_ack_bitmap,
             PacketType.FILE_DONE: self._handle_file_done,
+            PacketType.FILE_CANCEL: self._handle_file_cancel,
         }.get(packet.type)
         if handler:
             handler(packet)
         elif packet.type != PacketType.HELLO:
             print(f"[CM] [WARN] Unknown packet type: {packet.type}")
+
+    # ==========================================================
+    # Обработчики протокола
+    # ==========================================================
 
     def _handle_msg(self, packet: Packet) -> None:
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
@@ -348,6 +395,13 @@ class ConnectionManager:
             return
         with self._pending_lock:
             self._pending.pop(acked_seq, None)
+            cb = self._file_info_callbacks.pop(acked_seq, None)
+        if cb is not None:
+            on_ack, _on_fail = cb
+            try:
+                on_ack()
+            except Exception as e:
+                print(f"[CM] file_info on_ack error: {e}")
 
     def _handle_typing(self, packet: Packet) -> None:
         try:
@@ -437,10 +491,6 @@ class ConnectionManager:
             self.disconnect()
             return
         if self._on_password_retry is not None:
-            try:
-                reason = unpack_password_reject(packet)
-            except ProtocolError:
-                reason = "Invalid password"
             self._on_password_retry(self._max_password_attempts - self._password_attempts)
 
     def _handle_ping(self, packet: Packet) -> None:
@@ -456,12 +506,17 @@ class ConnectionManager:
         self._pending_messages.clear()
         with self._pending_lock:
             self._pending.clear()
+            self._file_info_callbacks.clear()
         self._crypto = None
         self._key_exchange_start_time = None
         self._key_exchange_attempts = 0
         self._password_verified = False
         self._last_pong_time = time.time()
         self._ping_missed = 0
+
+    # ==========================================================
+    # Файловые пакеты
+    # ==========================================================
 
     def _handle_file_info(self, packet: Packet) -> None:
         if self._file_manager is None or not self._key_exchanged or not self._password_verified:
@@ -477,11 +532,11 @@ class ConnectionManager:
         if self._file_manager is None or not self._key_exchanged or not self._password_verified:
             return
         try:
-            if len(packet.payload) < 6:
+            if len(packet.payload) < 8:
                 return
             file_id = int.from_bytes(packet.payload[:4], "big")
-            chunk_seq = int.from_bytes(packet.payload[4:6], "big")
-            encrypted = packet.payload[6:]
+            chunk_seq = int.from_bytes(packet.payload[4:8], "big")
+            encrypted = packet.payload[8:]
             self._file_manager.handle_file_chunk_packet(packet.seq, file_id, chunk_seq, encrypted)
         except Exception as e:
             print(f"[CM] File chunk error: {e}")
@@ -490,22 +545,19 @@ class ConnectionManager:
         if self._file_manager is None or not self._key_exchanged or not self._password_verified:
             return
         try:
-            if len(packet.payload) < 6:
+            if len(packet.payload) < 8:
                 return
             file_id = int.from_bytes(packet.payload[:4], "big")
-            chunk_seq = int.from_bytes(packet.payload[4:6], "big")
+            chunk_seq = int.from_bytes(packet.payload[4:8], "big")
             self._file_manager.handle_file_chunk_ack_packet(file_id, chunk_seq)
         except Exception as e:
             print(f"[CM] File ack error: {e}")
 
     def _handle_file_chunk_ack_bitmap(self, packet: Packet) -> None:
-        if self._file_manager is None or not self._key_exchanged or not self._password_verified:
-            return
-        try:
-            file_id, base_seq, bitmap = unpack_file_chunk_ack_bitmap(packet.payload)
-            self._file_manager.handle_file_chunk_ack_bitmap_packet(file_id, base_seq, bitmap)
-        except Exception as e:
-            print(f"[CM] File bitmap ack error: {e}")
+        # ← ФИКС БАГА №3: v2 file_transfer использует кумулятивный ACK,
+        # bitmap не поддерживается. Заглушка — на случай старого клиента
+        # на другой стороне. Раньше был AttributeError на отсутствующий метод.
+        return
 
     def _handle_file_done(self, packet: Packet) -> None:
         if self._file_manager is None or not self._key_exchanged or not self._password_verified:
@@ -516,10 +568,24 @@ class ConnectionManager:
                 return
             file_id = int.from_bytes(packet.payload[:4], "big")
             self._file_manager.handle_file_done_packet(file_id)
-            if self._on_file_progress is not None:
-                self._on_file_progress(file_id, 1.0, True)
         except Exception as e:
             print(f"[CM] FILE_DONE error: {e}")
+
+    def _handle_file_cancel(self, packet: Packet) -> None:
+        if self._file_manager is None:
+            return
+        try:
+            file_id, by_sender = unpack_file_cancel(packet)
+        except ProtocolError:
+            return
+        if by_sender:
+            self._file_manager.abort_receive(file_id)
+        else:
+            self._file_manager.abort_send(file_id)
+
+    # ==========================================================
+    # Дедуп + ретраи + реконнект
+    # ==========================================================
 
     def _is_duplicate(self, seq: int) -> bool:
         with self._dedup_lock:
@@ -573,6 +639,13 @@ class ConnectionManager:
                 if entry.attempts >= MAX_RESEND_ATTEMPTS:
                     with self._pending_lock:
                         self._pending.pop(seq, None)
+                        cb = self._file_info_callbacks.pop(seq, None)
+                    if cb is not None:
+                        _on_ack, on_fail = cb
+                        try:
+                            on_fail()
+                        except Exception as e:
+                            print(f"[CM] file_info on_fail error: {e}")
                     if entry.kind == "msg" and self._on_message_failed is not None:
                         try:
                             self._on_message_failed(entry.text)

@@ -347,13 +347,13 @@ class UdpTransport(ITransport):
                 continue
 
             if self._peer_addr is not None and addr != self._peer_addr:
+                print(f"[UDP] [DROP] got from {addr}, expected {self._peer_addr} — dropping")
                 continue
 
             try:
                 self._deliver(data)
             except Exception as e:
                 print(f"[UDP] [ERROR] Deliver callback failed: {e}")
-
     def _close_socket(self) -> None:
         self._peer_addr = None
         if self._sock is not None:

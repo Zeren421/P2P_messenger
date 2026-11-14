@@ -1,5 +1,11 @@
 """
-FileTransferManager — с поддержкой кумулятивных ACK (битмап)
+FileTransferManager v2 — с мгновенными ACK-ами и последовательной записью на диск.
+
+Фикс (ACK starvation):
+  * Убран ACK_INTERVAL — ACK шлётся на КАЖДЫЙ чанк.
+  * Раньше throttle 5 мс приводил к тому, что отправитель слал пачку,
+    получатель отвечал одним ACK, отправитель ждал RTO, окно схлопывалось
+    до минимума, скорость падала 73 -> 30 -> 18 КБ/с.
 """
 
 from __future__ import annotations
@@ -8,102 +14,88 @@ import os
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Dict, List, Set
+from typing import Callable, Optional, Dict, Set
 from io import BytesIO
 
 from protocol import (
-    pack_file_info, pack_file_chunk, pack_file_chunk_ack, pack_file_done,
-    pack_file_chunk_ack_bitmap, unpack_file_chunk_ack_bitmap, PacketType
+    pack_file_chunk, pack_file_chunk_ack, pack_file_done,
+    pack_file_cancel, PacketType,
 )
 
-CHUNK_SIZE = 1000
+# ============================================================
+# Тюнинг
+# ============================================================
 
-INITIAL_WINDOW_SIZE = 32
-MAX_WINDOW_SIZE = 512
-MIN_WINDOW_SIZE = 8
+CHUNK_SIZE = 1200
 
-MAX_CHUNK_ATTEMPTS = 50
+INITIAL_WINDOW_BYTES = 64 * 1024
+MAX_WINDOW_BYTES     = 16 * 1024 * 1024
+MIN_WINDOW_BYTES     = 8 * 1024
+
+RTO_INITIAL = 0.5
+RTO_MIN = 0.1
+RTO_MAX = 5.0
+
+FAST_RETRANSMIT_THRESHOLD = 3
+MAX_CHUNK_ATTEMPTS = 30       # было 12 — на всякий случай повыше
 MAX_CONCURRENT_TRANSFERS = 1
+
+PROGRESS_INTERVAL = 0.1
+ACK_NOTHING = 0xFFFFFFFF
+
 
 class FileTransferError(Exception):
     pass
 
+
 # ============================================================
-#  БИНАРНЫЙ ФОРМАТ FILE_INFO
+# Бинарный FILE_INFO
 # ============================================================
 
-def build_file_info_payload(
-    file_id: int,
-    filename: str,
-    total_size: int,
-    caption: str,
-    thumbnail: bytes,
-) -> bytes:
-    filename_bytes = filename.encode("utf-8")
-    caption_bytes = caption.encode("utf-8")
-
-    if len(filename_bytes) > 65535:
-        filename_bytes = filename_bytes[:65535]
-    if len(caption_bytes) > 65535:
-        caption_bytes = caption_bytes[:65535]
+def build_file_info_payload(file_id, filename, total_size, caption, thumbnail) -> bytes:
+    filename_bytes = filename.encode("utf-8")[:65535]
+    caption_bytes = caption.encode("utf-8")[:65535]
     if len(thumbnail) > 8000:
         thumbnail = thumbnail[:8000]
-
-    payload = (
-        file_id.to_bytes(4, "big") +
-        len(filename_bytes).to_bytes(2, "big") +
-        filename_bytes +
-        total_size.to_bytes(4, "big") +
-        len(caption_bytes).to_bytes(2, "big") +
-        caption_bytes +
-        len(thumbnail).to_bytes(2, "big") +
-        thumbnail
+    return (
+        file_id.to_bytes(4, "big")
+        + len(filename_bytes).to_bytes(2, "big") + filename_bytes
+        + total_size.to_bytes(8, "big")  # <--- 8 БАЙТ ВМЕСТО 4
+        + len(caption_bytes).to_bytes(2, "big") + caption_bytes
+        + len(thumbnail).to_bytes(2, "big") + thumbnail
     )
-    return payload
 
-def parse_file_info_payload(data: bytes) -> tuple[int, str, int, str, bytes]:
-    if len(data) < 6:
-        raise ValueError("FILE_INFO too short")
-
-    offset = 0
-    file_id = int.from_bytes(data[offset:offset+4], "big")
-    offset += 4
-
-    if len(data) < offset + 2:
-        raise ValueError("No filename length")
-    name_len = int.from_bytes(data[offset:offset+2], "big")
-    offset += 2
-    if len(data) < offset + name_len:
-        raise ValueError("Filename truncated")
-    filename = data[offset:offset+name_len].decode("utf-8", errors="replace")
-    offset += name_len
-
-    if len(data) < offset + 4:
-        raise ValueError("No file size")
-    total_size = int.from_bytes(data[offset:offset+4], "big")
-    offset += 4
-
-    if len(data) < offset + 2:
-        raise ValueError("No caption length")
-    caption_len = int.from_bytes(data[offset:offset+2], "big")
-    offset += 2
-    caption = data[offset:offset+caption_len].decode("utf-8", errors="replace")
-    offset += caption_len
-
-    if len(data) < offset + 2:
-        raise ValueError("No thumbnail length")
-    thumb_len = int.from_bytes(data[offset:offset+2], "big")
-    offset += 2
-    thumbnail = data[offset:offset+thumb_len]
-    offset += thumb_len
-
+def parse_file_info_payload(data: bytes):
+    o = 0
+    file_id = int.from_bytes(data[o:o+4], "big"); o += 4
+    nl = int.from_bytes(data[o:o+2], "big"); o += 2
+    filename = data[o:o+nl].decode("utf-8", "replace"); o += nl
+    total_size = int.from_bytes(data[o:o+8], "big"); o += 8  # <--- 8 БАЙТ ВМЕСТО 4
+    cl = int.from_bytes(data[o:o+2], "big"); o += 2
+    caption = data[o:o+cl].decode("utf-8", "replace"); o += cl
+    tl = int.from_bytes(data[o:o+2], "big"); o += 2
+    thumbnail = data[o:o+tl]
     return file_id, filename, total_size, caption, thumbnail
 
-# ============================================================
-#  ГЕНЕРАЦИЯ МИНИАТЮРЫ
-# ============================================================
+def generate_thumbnail_from_file(filepath: str, max_size: int = 200) -> bytes:
+    try:
+        from PIL import Image
+        img = Image.open(filepath)
+        return _thumb_from_image(img, max_size)
+    except Exception:
+        return b""
 
-def _thumbnail_bytes_from_image(img, max_size: int = 200) -> bytes:
+
+def generate_thumbnail_from_bytes(data: bytes, max_size: int = 200) -> bytes:
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(data))
+        return _thumb_from_image(img, max_size)
+    except Exception:
+        return b""
+
+
+def _thumb_from_image(img, max_size):
     from PIL import Image
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
@@ -118,63 +110,60 @@ def _thumbnail_bytes_from_image(img, max_size: int = 200) -> bytes:
     img.save(buf, format="JPEG", quality=50)
     return buf.getvalue()
 
-def generate_thumbnail_from_file(filepath: str, max_size: int = 200) -> bytes:
-    try:
-        from PIL import Image
-        img = Image.open(filepath)
-        return _thumbnail_bytes_from_image(img, max_size)
-    except Exception:
-        return b""
-
-def generate_thumbnail_from_bytes(data: bytes, max_size: int = 200) -> bytes:
-    try:
-        from PIL import Image
-        img = Image.open(BytesIO(data))
-        return _thumbnail_bytes_from_image(img, max_size)
-    except Exception:
-        return b""
 
 # ============================================================
-#  ВСПОМОГАТЕЛЬНЫЕ ДАТАКЛАССЫ
+# Состояние
 # ============================================================
 
 @dataclass
-class OutgoingChunkMeta:
+class OutgoingChunk:
     chunk_seq: int
-    sent_at: float = 0.0
-    attempts: int = 0
-    acked: bool = False
+    first_sent_at: float
+    last_sent_at: float
+    attempts: int = 1
+    retransmitted: bool = False
+
 
 @dataclass
 class SendingFile:
     file_id: int
-    filepath: str
     filename: str
     caption: str
     thumbnail: bytes
     total_size: int
     total_chunks: int
-    window_size: int = INITIAL_WINDOW_SIZE
-    rtt_samples: List[float] = field(default_factory=list)
-    cancelled: bool = False
-    file_handle: Optional[object] = None
-    chunks: Dict[int, OutgoingChunkMeta] = field(default_factory=dict)
-    _next_chunk_to_send: int = 0
 
-    def resend_timeout(self) -> float:
-        if not self.rtt_samples:
-            return 0.8
-        recent = self.rtt_samples[-5:]
-        avg_rtt = sum(recent) / len(recent)
-        return max(0.05, min(1.0, avg_rtt * 2.0))
+    file_handle: Optional[object] = None
+    memory_data: Optional[bytes] = None
+
+    window_bytes: int = INITIAL_WINDOW_BYTES
+    ssthresh: int = MAX_WINDOW_BYTES
+    in_slow_start: bool = True
+
+    next_chunk: int = 0
+    highest_acked: int = -1
+    inflight: Dict[int, OutgoingChunk] = field(default_factory=dict)
+    dup_ack_count: int = 0
+
+    srtt: Optional[float] = None
+    rttvar: float = 0.0
+
+    cancelled: bool = False
+    file_info_acked: bool = False
+    done_sent: bool = False
+
+    last_progress_emit: float = 0.0
+
+    def total_acked_bytes(self) -> int:
+        b = (self.highest_acked + 1) * CHUNK_SIZE
+        return min(b, self.total_size)
 
     def close_file(self) -> None:
         if self.file_handle is not None:
-            try:
-                self.file_handle.close()
-            except:
-                pass
+            try: self.file_handle.close()
+            except: pass
             self.file_handle = None
+
 
 @dataclass
 class ReceivingFile:
@@ -185,32 +174,40 @@ class ReceivingFile:
     total_size: int
     total_chunks: int
     save_path: str
+    file_handle: object
+
+    next_write_chunk: int = 0
+    pending_chunks: Dict[int, bytes] = field(default_factory=dict)
+
     started_at: float = field(default_factory=time.time)
-    file_handle: Optional[object] = None
-    received_chunks: Set[int] = field(default_factory=set)
     done_sent: bool = False
 
+    last_progress_emit: float = 0.0
+
     def is_complete(self) -> bool:
-        return len(self.received_chunks) == self.total_chunks
+        return self.next_write_chunk >= self.total_chunks
 
     def write_chunk(self, chunk_seq: int, data: bytes) -> None:
         if self.file_handle is None:
             return
-        offset = chunk_seq * CHUNK_SIZE
-        self.file_handle.seek(offset)
-        self.file_handle.write(data)
-        self.received_chunks.add(chunk_seq)
+        if chunk_seq < self.next_write_chunk:
+            return
+        self.pending_chunks[chunk_seq] = data
+        while self.next_write_chunk in self.pending_chunks:
+            next_data = self.pending_chunks.pop(self.next_write_chunk)
+            self.file_handle.write(next_data)
+            self.next_write_chunk += 1
 
     def close_file(self) -> None:
+        self.pending_chunks.clear()
         if self.file_handle is not None:
-            try:
-                self.file_handle.close()
-            except:
-                pass
+            try: self.file_handle.close()
+            except: pass
             self.file_handle = None
 
+
 # ============================================================
-#  ОСНОВНОЙ КЛАСС
+# Менеджер
 # ============================================================
 
 class FileTransferManager:
@@ -220,20 +217,24 @@ class FileTransferManager:
         encrypt: Callable[[bytes, int], bytes],
         decrypt: Callable[[bytes, int], bytes],
         next_seq: Callable[[], int],
+        send_reliable_file_info: Optional[Callable] = None,
         on_progress: Optional[Callable[[int, float, bool], None]] = None,
         on_file_received: Optional[Callable[[int, str, str], None]] = None,
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
+        on_file_cancelled: Optional[Callable[[int, bool], None]] = None,
         downloads_dir: str = ".",
     ) -> None:
         self._send_raw = send_raw
         self._encrypt = encrypt
         self._decrypt = decrypt
         self._next_seq = next_seq
+        self._send_reliable_file_info = send_reliable_file_info
         self._on_progress = on_progress
         self._on_file_received = on_file_received
         self._on_file_error = on_file_error
         self._on_file_info = on_file_info
+        self._on_file_cancelled = on_file_cancelled
         self._downloads_dir = downloads_dir
 
         self._lock = threading.Lock()
@@ -243,7 +244,6 @@ class FileTransferManager:
 
         self._running = False
         self._pump_thread: Optional[threading.Thread] = None
-        self._bitmap_window = 64  # размер битмапа
 
     def start(self) -> None:
         self._running = True
@@ -255,28 +255,20 @@ class FileTransferManager:
         if self._pump_thread is not None:
             self._pump_thread.join(timeout=1.0)
         with self._lock:
-            for f in self._outgoing.values():
-                f.close_file()
-            for f in self._incoming.values():
-                f.close_file()
+            for f in self._outgoing.values(): f.close_file()
+            for f in self._incoming.values(): f.close_file()
             self._outgoing.clear()
             self._incoming.clear()
 
-    def send_file(
-        self,
-        filepath: str,
-        caption: str = "",
-        thumbnail: Optional[bytes] = None,
-    ) -> int:
+    def send_file(self, filepath: str, caption: str = "",
+                  thumbnail: Optional[bytes] = None) -> int:
         if not os.path.isfile(filepath):
             raise FileTransferError(f"File not found: {filepath}")
-
         total_size = os.path.getsize(filepath)
         if total_size == 0:
             raise FileTransferError("File is empty")
-        if total_size > 2_147_483_647:
-            raise FileTransferError("File too large (max 2 GB)")
-
+        if total_size > 50 * 1024 * 1024 * 1024:  # 50 ГБ
+            raise FileTransferError("File too large (max 50 GB)")
         if thumbnail is None:
             thumbnail = generate_thumbnail_from_file(filepath)
 
@@ -287,64 +279,29 @@ class FileTransferManager:
             file_id = self._next_file_id
             self._next_file_id += 1
 
-        total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-        filename = os.path.basename(filepath)
-
         try:
-            file_handle = open(filepath, "rb")
+            fh = open(filepath, "rb")
         except OSError as e:
             raise FileTransferError(f"Failed to open file: {e}")
 
-        sending = SendingFile(
+        sending = self._make_sending(
             file_id=file_id,
-            filepath=filepath,
-            filename=filename,
+            filename=os.path.basename(filepath),
             caption=caption,
             thumbnail=thumbnail or b"",
             total_size=total_size,
-            total_chunks=total_chunks,
-            window_size=INITIAL_WINDOW_SIZE,
-            file_handle=file_handle,
+            file_handle=fh,
         )
-
-        for chunk_seq in range(total_chunks):
-            sending.chunks[chunk_seq] = OutgoingChunkMeta(chunk_seq=chunk_seq)
-
-        with self._lock:
-            self._outgoing[file_id] = sending
-
-        seq = self._next_seq()
-        info_plaintext = build_file_info_payload(
-            file_id=file_id,
-            filename=filename,
-            total_size=total_size,
-            caption=caption,
-            thumbnail=thumbnail or b"",
-        )
-        encrypted_info = self._encrypt(info_plaintext, seq)
-        self._send_raw(pack_file_info(seq, encrypted_info))
-
-        self._kick_window(file_id)
+        self._start_sending(sending)
         return file_id
 
-    def send_memory_file(
-        self,
-        data: bytes,
-        filename: str,
-        caption: str = "",
-        thumbnail: Optional[bytes] = None,
-    ) -> int:
-        """
-        Аналог send_file(), но источник данных — байты в памяти, а не файл на
-        диске. Используется, например, для отправки скриншота прямо из
-        буфера обмена без создания временного файла.
-        """
+    def send_memory_file(self, data: bytes, filename: str,
+                         caption: str = "", thumbnail: Optional[bytes] = None) -> int:
         total_size = len(data)
         if total_size == 0:
             raise FileTransferError("Data is empty")
-        if total_size > 2_147_483_647:
-            raise FileTransferError("File too large (max 2 GB)")
-
+        if total_size > 50 * 1024 * 1024 * 1024:  # 50 ГБ
+            raise FileTransferError("File too large (max 50 GB)")
         if thumbnail is None:
             thumbnail = generate_thumbnail_from_bytes(data)
 
@@ -355,109 +312,168 @@ class FileTransferManager:
             file_id = self._next_file_id
             self._next_file_id += 1
 
-        total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-        # BytesIO поддерживает тот же интерфейс seek/read/close, что и обычный
-        # файловый хендл, поэтому его можно использовать вместо file_handle
-        # без изменений в _send_chunk/_kick_window.
-        file_handle = BytesIO(data)
-
-        sending = SendingFile(
+        sending = self._make_sending(
             file_id=file_id,
-            filepath="",
             filename=filename,
             caption=caption,
             thumbnail=thumbnail or b"",
             total_size=total_size,
-            total_chunks=total_chunks,
-            window_size=INITIAL_WINDOW_SIZE,
-            file_handle=file_handle,
+            file_handle=BytesIO(data),
+            memory_data=data,
         )
-
-        for chunk_seq in range(total_chunks):
-            sending.chunks[chunk_seq] = OutgoingChunkMeta(chunk_seq=chunk_seq)
-
-        with self._lock:
-            self._outgoing[file_id] = sending
-
-        seq = self._next_seq()
-        info_plaintext = build_file_info_payload(
-            file_id=file_id,
-            filename=filename,
-            total_size=total_size,
-            caption=caption,
-            thumbnail=thumbnail or b"",
-        )
-        encrypted_info = self._encrypt(info_plaintext, seq)
-        self._send_raw(pack_file_info(seq, encrypted_info))
-
-        self._kick_window(file_id)
+        self._start_sending(sending)
         return file_id
 
-    def cancel_send(self, file_id: int) -> None:
+    def _make_sending(self, file_id, filename, caption, thumbnail,
+                      total_size, file_handle, memory_data=None) -> SendingFile:
+        total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        return SendingFile(
+            file_id=file_id,
+            filename=filename,
+            caption=caption,
+            thumbnail=thumbnail,
+            total_size=total_size,
+            total_chunks=total_chunks,
+            file_handle=file_handle,
+            memory_data=memory_data,
+        )
+
+    def _start_sending(self, sending: SendingFile) -> None:
+        with self._lock:
+            self._outgoing[sending.file_id] = sending
+
+        info = build_file_info_payload(
+            sending.file_id, sending.filename, sending.total_size,
+            sending.caption, sending.thumbnail,
+        )
+
+        if self._send_reliable_file_info is not None:
+            self._send_reliable_file_info(
+                sending.file_id, info,
+                lambda: self._on_file_info_acked(sending.file_id),
+                lambda: self._on_file_info_failed(sending.file_id),
+            )
+        else:
+            from protocol import pack_file_info
+            for _ in range(3):
+                seq = self._next_seq()
+                enc = self._encrypt(info, seq)
+                self._send_raw(pack_file_info(seq, enc))
+            self._on_file_info_acked(sending.file_id)
+
+    def _on_file_info_acked(self, file_id: int) -> None:
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is not None:
-                sending.cancelled = True
-                sending.close_file()
+            if sending is None: return
+            sending.file_info_acked = True
+        self._kick_window(file_id)
 
-    # ------------------------------------------------------------------
-    # Обработка входящих пакетов
-    # ------------------------------------------------------------------
+    def _on_file_info_failed(self, file_id: int) -> None:
+        self._abort_send(file_id)
+        if self._on_file_error:
+            try: self._on_file_error(file_id, "FILE_INFO delivery failed")
+            except Exception: pass
+
+    def cancel_send(self, file_id: int) -> None:
+        if self._abort_send(file_id):
+            self._send_raw(pack_file_cancel(self._next_seq(), file_id, by_sender=True))
+
+    def cancel_receive(self, file_id: int) -> None:
+        if self._abort_receive(file_id):
+            self._send_raw(pack_file_cancel(self._next_seq(), file_id, by_sender=False))
+
+    def abort_send(self, file_id: int) -> None: self._abort_send(file_id)
+    def abort_receive(self, file_id: int) -> None: self._abort_receive(file_id)
+
+    def _abort_send(self, file_id: int) -> bool:
+        with self._lock:
+            s = self._outgoing.pop(file_id, None)
+        if s is None: return False
+        s.cancelled = True
+        s.close_file()
+        if self._on_file_cancelled:
+            try: self._on_file_cancelled(file_id, True)
+            except Exception: pass
+        return True
+
+    def _abort_receive(self, file_id: int) -> bool:
+        with self._lock:
+            r = self._incoming.pop(file_id, None)
+        if r is None: return False
+        r.close_file()
+        try: os.remove(r.save_path)
+        except OSError: pass
+        if self._on_file_cancelled:
+            try: self._on_file_cancelled(file_id, False)
+            except Exception: pass
+        return True
+
+    def _maybe_emit_progress(self, file_id: int, ratio: float,
+                             is_outgoing: bool, state_obj) -> None:
+        if self._on_progress is None:
+            return
+        now = time.time()
+        if ratio < 1.0 and now - state_obj.last_progress_emit < PROGRESS_INTERVAL:
+            return
+        state_obj.last_progress_emit = now
+        try:
+            self._on_progress(file_id, ratio, is_outgoing)
+        except Exception:
+            pass
 
     def handle_file_info_packet(self, seq: int, payload: bytes) -> None:
         try:
             decrypted = self._decrypt(payload, seq)
             file_id, filename, total_size, caption, thumbnail = parse_file_info_payload(decrypted)
         except Exception as e:
-            if self._on_file_error is not None:
-                self._on_file_error(0, f"Failed to parse FILE_INFO: {e}")
+            if self._on_file_error:
+                try: self._on_file_error(0, f"Failed to parse FILE_INFO: {e}")
+                except Exception: pass
             return
 
-        if total_size > 2_147_483_647:
-            if self._on_file_error is not None:
-                self._on_file_error(file_id, "File too large (max 2 GB)")
+        if total_size > 50 * 1024 * 1024 * 1024:
+            if self._on_file_error:
+                try: self._on_file_error(file_id, "File too large (max 50 GB)")
+                except Exception: pass
             return
+        with self._lock:
+            if file_id in self._incoming:
+                return
 
         safe_name = os.path.basename(filename) or f"file_{file_id}"
         save_path = self._unique_save_path(safe_name)
-
         try:
-            file_handle = open(save_path, "w+b")
-            file_handle.truncate(total_size)
+            fh = open(save_path, "w+b")
+            fh.truncate(total_size)
         except OSError as e:
-            if self._on_file_error is not None:
-                self._on_file_error(file_id, f"Failed to create file: {e}")
+            if self._on_file_error:
+                try: self._on_file_error(file_id, f"Failed to create file: {e}")
+                except Exception: pass
             return
 
+        incoming = ReceivingFile(
+            file_id=file_id, filename=safe_name, caption=caption,
+            thumbnail=thumbnail, total_size=total_size,
+            total_chunks=(total_size + CHUNK_SIZE - 1) // CHUNK_SIZE,
+            save_path=save_path, file_handle=fh,
+        )
         with self._lock:
-            self._incoming[file_id] = ReceivingFile(
-                file_id=file_id,
-                filename=safe_name,
-                caption=caption,
-                thumbnail=thumbnail,
-                total_size=total_size,
-                total_chunks=(total_size + CHUNK_SIZE - 1) // CHUNK_SIZE,
-                save_path=save_path,
-                file_handle=file_handle,
-            )
+            self._incoming[file_id] = incoming
 
-        if self._on_file_info is not None:
-            try:
-                self._on_file_info(file_id, safe_name, total_size, thumbnail, caption)
-            except Exception as e:
-                print(f"[FT] on_file_info error: {e}")
+        if self._on_file_info:
+            try: self._on_file_info(file_id, safe_name, total_size, thumbnail, caption)
+            except Exception as e: print(f"[FT] on_file_info error: {e}")
 
-    def handle_file_chunk_packet(self, seq: int, file_id: int, chunk_seq: int, encrypted_data: bytes) -> None:
+    def handle_file_chunk_packet(self, seq: int, file_id: int,
+                                 chunk_seq: int, encrypted_data: bytes) -> None:
         with self._lock:
             incoming = self._incoming.get(file_id)
 
         if incoming is None:
-            # Если файл не найден, всё равно отправляем ACK, чтобы отправитель не ждал
-            self._send_chunk_ack(file_id, chunk_seq)
             return
 
-        if chunk_seq in incoming.received_chunks:
-            self._send_chunk_ack(file_id, chunk_seq)
+        if chunk_seq < incoming.next_write_chunk or chunk_seq in incoming.pending_chunks:
+            self._send_ack(incoming)  # дубликат — просто ACK-аем
             return
 
         try:
@@ -468,69 +484,99 @@ class FileTransferManager:
         try:
             incoming.write_chunk(chunk_seq, data)
         except Exception as e:
-            if self._on_file_error is not None:
-                self._on_file_error(file_id, f"Write error: {e}")
+            if self._on_file_error:
+                try: self._on_file_error(file_id, f"Write error: {e}")
+                except Exception: pass
             return
 
-        # Отправляем ACK на каждый чанк (или можно оставить битмап, но чаще)
-        self._send_chunk_ack(file_id, chunk_seq)
+        self._send_ack(incoming)  # ACK на КАЖДЫЙ чанк
 
-        if self._on_progress is not None:
-            # Считаем прогресс по БАЙТАМ, а не по штукам чанков. 
-            # Это даёт плавное обновление даже для огромных файлов.
-            received_bytes = len(incoming.received_chunks) * CHUNK_SIZE
-            if received_bytes > incoming.total_size:
-                received_bytes = incoming.total_size
-            ratio = received_bytes / incoming.total_size
-            self._on_progress(file_id, ratio, False)
+        if not incoming.is_complete():
+            got = min(incoming.next_write_chunk, incoming.total_chunks) * CHUNK_SIZE
+            got = min(got, incoming.total_size)
+            ratio = got / incoming.total_size
+            self._maybe_emit_progress(file_id, ratio, False, incoming)
 
         if incoming.is_complete():
             self._finish_incoming(incoming)
 
-    def handle_file_chunk_ack_packet(self, file_id: int, chunk_seq: int) -> None:
+    def handle_file_chunk_ack_packet(self, file_id: int, cumulative_ack: int) -> None:
+        if cumulative_ack == ACK_NOTHING:
+            with self._lock:
+                sending = self._outgoing.get(file_id)
+                if sending is None or sending.cancelled:
+                    return
+                sending.dup_ack_count += 1
+                if sending.dup_ack_count == FAST_RETRANSMIT_THRESHOLD:
+                    chunk = sending.inflight.get(0)
+                    if chunk and not chunk.retransmitted:
+                        chunk.retransmitted = True
+                        chunk.attempts += 1
+                        chunk.last_sent_at = time.time()
+                        self._send_chunk_data(sending, 0, chunk)
+                        sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
+                        sending.ssthresh = sending.window_bytes
+                        sending.in_slow_start = False
+            return
+
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is None:
+            if sending is None or sending.cancelled:
                 return
-            chunk = sending.chunks.get(chunk_seq)
-            if chunk is not None:
-                chunk.acked = True
-                if chunk.sent_at > 0:
-                    rtt = time.time() - chunk.sent_at
-                    sending.rtt_samples.append(rtt)
-                    if len(sending.rtt_samples) > 20:
-                        sending.rtt_samples.pop(0)
-                    avg_rtt = sum(sending.rtt_samples) / len(sending.rtt_samples)
-                    if avg_rtt > 0.5:
-                        sending.window_size = max(MIN_WINDOW_SIZE, int(sending.window_size * 0.8))
-                    elif avg_rtt < 0.1 and sending.window_size < MAX_WINDOW_SIZE:
-                        sending.window_size = min(MAX_WINDOW_SIZE, sending.window_size + 2)
 
-        self._kick_window(file_id)
+            now = time.time()
 
-    def handle_file_chunk_ack_bitmap_packet(self, file_id: int, base_seq: int, bitmap: int) -> None:
+            if cumulative_ack > sending.highest_acked:
+                sending.highest_acked = cumulative_ack
+
+                chunk = sending.inflight.get(cumulative_ack)
+                if chunk and not chunk.retransmitted:
+                    sample = now - chunk.first_sent_at
+                    if sample > 0:
+                        self._update_rtt(sending, sample)
+
+                for s in [k for k in sending.inflight if k <= cumulative_ack]:
+                    del sending.inflight[s]
+
+                sending.dup_ack_count = 0
+
+                if sending.in_slow_start:
+                    sending.window_bytes += CHUNK_SIZE
+                    if sending.window_bytes >= sending.ssthresh:
+                        sending.in_slow_start = False
+                else:
+                    sending.window_bytes += max(
+                        1, (CHUNK_SIZE * CHUNK_SIZE) // sending.window_bytes
+                    )
+                sending.window_bytes = min(sending.window_bytes, MAX_WINDOW_BYTES)
+
+            else:
+                sending.dup_ack_count += 1
+                if sending.dup_ack_count == FAST_RETRANSMIT_THRESHOLD:
+                    nxt = cumulative_ack + 1
+                    chunk = sending.inflight.get(nxt)
+                    if chunk and not chunk.retransmitted:
+                        chunk.retransmitted = True
+                        chunk.attempts += 1
+                        chunk.last_sent_at = now
+                        self._send_chunk_data(sending, nxt, chunk)
+                        sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
+                        sending.ssthresh = sending.window_bytes
+                        sending.in_slow_start = False
+
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is None:
-                return
-            for i in range(64):
-                if bitmap & (1 << i):
-                    chunk_seq = base_seq + i
-                    chunk = sending.chunks.get(chunk_seq)
-                    if chunk is not None:
-                        chunk.acked = True
-                        if chunk.sent_at > 0:
-                            rtt = time.time() - chunk.sent_at
-                            sending.rtt_samples.append(rtt)
-                            if len(sending.rtt_samples) > 20:
-                                sending.rtt_samples.pop(0)
-            # Обновляем окно (упрощённо)
-            if sending.rtt_samples:
-                avg_rtt = sum(sending.rtt_samples) / len(sending.rtt_samples)
-                if avg_rtt > 0.5:
-                    sending.window_size = max(MIN_WINDOW_SIZE, int(sending.window_size * 0.8))
-                elif avg_rtt < 0.1 and sending.window_size < MAX_WINDOW_SIZE:
-                    sending.window_size = min(MAX_WINDOW_SIZE, sending.window_size + 2)
+            if sending:
+                if sending.highest_acked < sending.total_chunks - 1:
+                    ratio = sending.total_acked_bytes() / sending.total_size
+                    self._maybe_emit_progress(file_id, ratio, True, sending)
+
+                if not sending.done_sent and sending.highest_acked >= sending.total_chunks - 1:
+                    sending.done_sent = True
+                    self._send_raw(pack_file_done(self._next_seq(), file_id))
+                    if self._on_progress:
+                        try: self._on_progress(file_id, 1.0, True)
+                        except Exception: pass
 
         self._kick_window(file_id)
 
@@ -541,124 +587,98 @@ class FileTransferManager:
                 sending.close_file()
                 self._outgoing.pop(file_id, None)
 
-    # ------------------------------------------------------------------
-    # Внутренние методы
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _update_rtt(sending: SendingFile, sample: float) -> None:
+        if sending.srtt is None:
+            sending.srtt = sample
+            sending.rttvar = sample / 2
+        else:
+            sending.rttvar = 0.75 * sending.rttvar + 0.25 * abs(sending.srtt - sample)
+            sending.srtt = 0.875 * sending.srtt + 0.125 * sample
+
+    @staticmethod
+    def _current_rto(sending: SendingFile) -> float:
+        if sending.srtt is None:
+            return RTO_INITIAL
+        rto = sending.srtt + 4.0 * sending.rttvar
+        return max(RTO_MIN, min(RTO_MAX, rto))
 
     def _unique_save_path(self, filename: str) -> str:
         base, ext = os.path.splitext(filename)
-        candidate = os.path.join(self._downloads_dir, filename)
+        cand = os.path.join(self._downloads_dir, filename)
         i = 1
-        while os.path.exists(candidate):
-            candidate = os.path.join(self._downloads_dir, f"{base} ({i}){ext}")
+        while os.path.exists(cand):
+            cand = os.path.join(self._downloads_dir, f"{base} ({i}){ext}")
             i += 1
-        return candidate
+        return cand
 
     def _finish_incoming(self, incoming: ReceivingFile) -> None:
+        if incoming.done_sent:
+            return
+        incoming.done_sent = True
         incoming.close_file()
-
         with self._lock:
             self._incoming.pop(incoming.file_id, None)
 
+        self._send_raw(pack_file_done(self._next_seq(), incoming.file_id))
+
+        if self._on_file_received:
+            try: self._on_file_received(incoming.file_id, incoming.filename, incoming.save_path)
+            except Exception: pass
+        if self._on_progress:
+            try: self._on_progress(incoming.file_id, 1.0, False)
+            except Exception: pass
+
+    def _send_ack(self, incoming: ReceivingFile) -> None:
+        """Шлёт ACK на каждый чанк. Без throttle — иначе отправитель
+        будет ждать ACK до RTO и схлопывать окно."""
         seq = self._next_seq()
-        self._send_raw(pack_file_done(seq, incoming.file_id))
+        val = incoming.next_write_chunk - 1 if incoming.next_write_chunk > 0 else ACK_NOTHING
+        self._send_raw(pack_file_chunk_ack(seq, incoming.file_id, val))
 
-        if self._on_file_received is not None:
-            self._on_file_received(incoming.file_id, incoming.filename, incoming.save_path)
-
-        if self._on_progress is not None:
-            self._on_progress(incoming.file_id, 1.0, False)
-
-    def _send_chunk(self, sending: SendingFile, chunk_meta: OutgoingChunkMeta) -> None:
-        offset = chunk_meta.chunk_seq * CHUNK_SIZE
+    def _send_chunk_data(self, sending: SendingFile, chunk_seq: int, meta: OutgoingChunk) -> bool:
+        offset = chunk_seq * CHUNK_SIZE
         try:
             sending.file_handle.seek(offset)
             data = sending.file_handle.read(CHUNK_SIZE)
         except Exception as e:
-            if self._on_file_error is not None:
-                self._on_file_error(sending.file_id, f"Read error: {e}")
-            return
+            if self._on_file_error:
+                try: self._on_file_error(sending.file_id, f"Read error: {e}")
+                except Exception: pass
+            return False
 
         seq = self._next_seq()
-        encrypted = self._encrypt(data, seq)
-        header = sending.file_id.to_bytes(4, "big") + chunk_meta.chunk_seq.to_bytes(2, "big")
-        payload = header + encrypted
-        
-        # ВОТ ЗДЕСЬ: проверяем, ушел ли пакет
-        if not self._send_raw(pack_file_chunk(seq, payload)):
-            # Если не ушел, не увеличиваем счетчик попыток, попробуем позже
-            return
-
-        chunk_meta.sent_at = time.time()
-        chunk_meta.attempts += 1
-    def _send_chunk_ack(self, file_id: int, chunk_seq: int) -> None:
-        """Отправляет ACK на конкретный полученный чанк."""
-        seq = self._next_seq()
-        self._send_raw(pack_file_chunk_ack(seq, file_id, chunk_seq))
-
-    def _send_bitmap_ack_if_needed(self, file_id: int) -> None:
-        with self._lock:
-            incoming = self._incoming.get(file_id)
-            if incoming is None:
-                return
-            # Если получено 64 чанка или файл завершён
-            if len(incoming.received_chunks) % 64 == 0 or incoming.is_complete():
-                # Собираем битмап для последних 64 чанков
-                base_seq = max(0, max(incoming.received_chunks) - 63)
-                bitmap = 0
-                for i in range(64):
-                    if (base_seq + i) in incoming.received_chunks:
-                        bitmap |= (1 << i)
-                seq = self._next_seq()
-                self._send_raw(pack_file_chunk_ack_bitmap(seq, file_id, base_seq, bitmap))
+        enc = self._encrypt(data, seq)
+        payload = sending.file_id.to_bytes(4, "big") + chunk_seq.to_bytes(4, "big") + enc
+        ok = self._send_raw(pack_file_chunk(seq, payload))
+        if ok:
+            now = time.time()
+            if meta.first_sent_at == 0:
+                meta.first_sent_at = now
+            meta.last_sent_at = now
+        return ok
 
     def _kick_window(self, file_id: int) -> None:
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is None or sending.cancelled:
+            if sending is None or sending.cancelled or not sending.file_info_acked:
                 return
 
-            in_flight = sum(1 for c in sending.chunks.values() if not c.acked and c.attempts > 0)
-            free_slots = max(0, sending.window_size - in_flight)
-            if free_slots == 0:
-                return
+            inflight_bytes = len(sending.inflight) * CHUNK_SIZE
 
-            start = sending._next_chunk_to_send
-            sent_any = False
-            for seq in range(start, sending.total_chunks):
-                if free_slots == 0:
+            while (inflight_bytes + CHUNK_SIZE <= sending.window_bytes
+                   and sending.next_chunk < sending.total_chunks):
+                cs = sending.next_chunk
+                meta = OutgoingChunk(chunk_seq=cs, first_sent_at=0, last_sent_at=0)
+                if not self._send_chunk_data(sending, cs, meta):
                     break
-                meta = sending.chunks.get(seq)
-                if meta is not None and not meta.acked and meta.attempts == 0:
-                    self._send_chunk(sending, meta)
-                    free_slots -= 1
-                    sent_any = True
-                    sending._next_chunk_to_send = seq + 1
-                else:
-                    continue
-
-    def _send_chunk(self, sending: SendingFile, chunk_meta: OutgoingChunkMeta) -> None:
-        offset = chunk_meta.chunk_seq * CHUNK_SIZE
-        try:
-            sending.file_handle.seek(offset)
-            data = sending.file_handle.read(CHUNK_SIZE)
-        except Exception as e:
-            if self._on_file_error is not None:
-                self._on_file_error(sending.file_id, f"Read error: {e}")
-            return
-
-        seq = self._next_seq()
-        encrypted = self._encrypt(data, seq)
-        header = sending.file_id.to_bytes(4, "big") + chunk_meta.chunk_seq.to_bytes(2, "big")
-        payload = header + encrypted
-        self._send_raw(pack_file_chunk(seq, payload))
-
-        chunk_meta.sent_at = time.time()
-        chunk_meta.attempts += 1
+                sending.inflight[cs] = meta
+                sending.next_chunk += 1
+                inflight_bytes += CHUNK_SIZE
 
     def _pump_loop(self) -> None:
         while self._running:
-            time.sleep(0.03)
+            time.sleep(0.01)
             now = time.time()
 
             with self._lock:
@@ -667,35 +687,27 @@ class FileTransferManager:
             for file_id in file_ids:
                 with self._lock:
                     sending = self._outgoing.get(file_id)
-                    if sending is None:
-                        continue
-                    if sending.cancelled:
-                        sending.close_file()
-                        self._outgoing.pop(file_id, None)
+                    if sending is None or sending.cancelled or not sending.file_info_acked:
                         continue
 
-                    timeout = sending.resend_timeout()
+                    rto = self._current_rto(sending)
 
-                    to_retry = [
-                        c for c in sending.chunks.values()
-                        if not c.acked and c.attempts > 0
-                        and (now - c.sent_at) >= timeout
-                        and c.attempts < MAX_CHUNK_ATTEMPTS
-                    ]
-                    failed = [
-                        c for c in sending.chunks.values()
-                        if not c.acked and c.attempts >= MAX_CHUNK_ATTEMPTS
-                    ]
-
-                if failed:
-                    if self._on_file_error is not None:
-                        self._on_file_error(file_id, "Some chunks lost, transfer aborted")
-                    with self._lock:
-                        sending.close_file()
-                        self._outgoing.pop(file_id, None)
-                    continue
-
-                for chunk_meta in to_retry:
-                    self._send_chunk(sending, chunk_meta)
+                    for meta in list(sending.inflight.values()):
+                        if now - meta.last_sent_at < rto:
+                            continue
+                        if meta.attempts >= MAX_CHUNK_ATTEMPTS:
+                            self._outgoing.pop(file_id, None)
+                            sending.close_file()
+                            if self._on_file_error:
+                                try:
+                                    self._on_file_error(file_id, "Chunk delivery failed (max attempts)")
+                                except Exception: pass
+                            break
+                        meta.attempts += 1
+                        meta.retransmitted = True
+                        self._send_chunk_data(sending, meta.chunk_seq, meta)
+                        sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
+                        sending.ssthresh = sending.window_bytes
+                        sending.in_slow_start = False
 
                 self._kick_window(file_id)

@@ -11,3 +11,6 @@ p2p_log.txt
 history.jsonl
 username.txt
 peer.txt
+*.mkv
+*.mp4
+p2p_log_*.txt
