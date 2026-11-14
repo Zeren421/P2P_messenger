@@ -81,21 +81,40 @@ class FileSenderHelper:
                 pass
             return False
 
-        from widgets.bubbles import FileBubble
+        from widgets.bubbles import FileBubble, VoiceBubble
 
-        bubble = FileBubble(
-            sender_name="Я",
-            file_id=file_id,
-            filename=filename,
-            file_size=size,
-            thumbnail=thumbnail,
-            caption=caption,
-            is_own=True,
-            time_str=datetime.now().strftime("%H:%M"),
-            parent=self.parent_widget,
-            original_bytes=original_bytes,
-        )
-
+        # Если это голосовое — используем VoiceBubble
+        is_voice = "_voice" in filename and filename.endswith(".wav")
+        if is_voice:
+            duration = 0.0
+            try:
+                import wave
+                with wave.open(filepath, "rb") as wf:
+                    duration = wf.getnframes() / wf.getframerate()
+            except Exception:
+                pass
+            bubble = VoiceBubble(
+                sender_name="Я",
+                file_id=file_id,
+                filename=filename,
+                duration_sec=duration,
+                is_own=True,
+                time_str=datetime.now().strftime("%H:%M"),
+                parent=self.parent_widget,
+            )
+        else:
+            bubble = FileBubble(
+                sender_name="Я",
+                file_id=file_id,
+                filename=filename,
+                file_size=size,
+                thumbnail=thumbnail,
+                caption=caption,
+                is_own=True,
+                time_str=datetime.now().strftime("%H:%M"),
+                parent=self.parent_widget,
+                original_bytes=original_bytes,
+            )
         # Колбэк отмены — ДО добавления в чат, чтобы кнопка сразу работала
         if hasattr(self.parent_widget, "_on_file_cancel"):
             bubble.set_cancel_callback(self.parent_widget._on_file_cancel)

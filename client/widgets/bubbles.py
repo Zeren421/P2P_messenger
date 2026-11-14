@@ -536,3 +536,194 @@ class FileBubble(QFrame):
                 shutil.copy(self.file_path, path)
             except Exception as e:
                 QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить: {e}")
+
+# ============================================================
+#  VOICE BUBBLE
+# ============================================================
+
+class VoiceBubble(QFrame):
+    """Пузырь для голосового сообщения: ▶️, длительность, waveform."""
+
+    def __init__(self, sender_name, file_id, filename, duration_sec,
+                 is_own=False, time_str=None, parent=None):
+        super().__init__(parent)
+        self.file_id = file_id
+        self.filename = filename
+        self.duration_sec = duration_sec
+        self.is_own = is_own
+        self.sender_name = sender_name
+        self.time_str = time_str or datetime.now().strftime("%H:%M")
+        self.file_path = ""
+        self._on_cancel_callback = None
+        self._player = None
+
+        self.setObjectName("voice_bubble")
+
+        if is_own:
+            bg = "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7a68ea, stop:1 #6c5ce7)"
+            border = "rgba(255,255,255,0.08)"
+            radius = "border-top-left-radius: 18px; border-top-right-radius: 18px; border-bottom-left-radius: 18px; border-bottom-right-radius: 4px;"
+            text_color = "#ffffff"
+            header_color = "rgba(255,255,255,0.6)"
+        else:
+            bg = "#1a1a2e"
+            border = "rgba(255,255,255,0.06)"
+            radius = "border-top-left-radius: 18px; border-top-right-radius: 18px; border-bottom-left-radius: 4px; border-bottom-right-radius: 18px;"
+            text_color = "#e8e8e8"
+            header_color = "#ff6b6b"
+
+        self.setStyleSheet(f"""
+            QFrame#voice_bubble {{
+                background: {bg};
+                border: 1px solid {border};
+                {radius}
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(6)
+
+        # Заголовок
+        header = QLabel(f"{self.sender_name} · {self.time_str}")
+        header.setStyleSheet(f"color: {header_color}; font-size: 11px; font-weight: 700;")
+        layout.addWidget(header)
+
+        # Строка: ▶ + waveform + длительность
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setFixedSize(40, 40)
+        self.play_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6c5ce7; color: white;
+                border: none; border-radius: 20px;
+                font-size: 16px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #7c6cf7; }
+        """)
+        self.play_btn.clicked.connect(self._toggle_play)
+        row.addWidget(self.play_btn)
+
+        # Waveform (прогресс-бар воспроизведения)
+        self.waveform = QProgressBar()
+        self.waveform.setRange(0, 1000)   # 0..1000 для плавности
+        self.waveform.setValue(0)
+        self.waveform.setTextVisible(False)
+        self.waveform.setFixedHeight(30)
+        self.waveform.setMinimumWidth(180)
+        self.waveform.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {text_color}22;
+                border: none;
+                border-radius: 6px;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ffd93d,
+                    stop:1 #ffb142);
+                border-radius: 6px;
+            }}
+        """)
+        row.addWidget(self.waveform, 1)
+
+        # Длительность
+        self.duration_label = QLabel(self._format_duration(duration_sec))
+        self.duration_label.setStyleSheet(f"color: {text_color}; font-size: 12px;")
+        row.addWidget(self.duration_label)
+
+        layout.addLayout(row)
+
+        # Статус
+        self.status_label = QLabel("⏳ Загрузка...")
+        self.status_label.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(self.status_label)
+
+        # Кнопка отмены
+        self._cancel_btn = QPushButton("✕ Отменить")
+        self._cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent; color: #ff6b6b;
+                border: 1px solid #ff6b6b; border-radius: 6px;
+                font-size: 11px; padding: 2px 8px;
+            }
+            QPushButton:hover { background-color: #ff6b6b; color: #000000; }
+        """)
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        self._cancel_btn.hide()
+        layout.addWidget(self._cancel_btn)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(22)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(108, 92, 231, 140) if is_own else QColor(0, 0, 0, 180))
+        self.setGraphicsEffect(shadow)
+        self.setMaximumWidth(450)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        sec = int(seconds)
+        if sec < 60:
+            return f"0:{sec:02d}"
+        return f"{sec // 60}:{sec % 60:02d}"
+
+    def update_progress(self, ratio: float) -> None:
+        if ratio >= 1.0:
+            self.status_label.setText("✓ Готово")
+            self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
+            self._cancel_btn.hide()
+        else:
+            self.status_label.setText(f"⏳ {int(ratio * 100)}%")
+            self._cancel_btn.show()
+
+    def set_file_path(self, path: str) -> None:
+        self.file_path = path
+        self.status_label.setText("✓ Готово")
+        self.status_label.setStyleSheet("color: #4caf50; font-size: 11px;")
+        self._cancel_btn.hide()
+
+    def set_cancel_callback(self, cb) -> None:
+        self._on_cancel_callback = cb
+
+    def _on_cancel_clicked(self) -> None:
+        if self._on_cancel_callback:
+            self._on_cancel_callback(self.file_id)
+        self.status_label.setText("❌ Отменено")
+        self._cancel_btn.hide()
+
+    def _toggle_play(self) -> None:
+        if not self.file_path or not os.path.exists(self.file_path):
+            return
+        from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+        from PyQt5.QtCore import QUrl
+
+        if self._player is None:
+            self._player = QMediaPlayer()
+            self._player.setMedia(QMediaContent(QUrl.fromLocalFile(self.file_path)))
+            # PyQt5 использует stateChanged, а не playbackStateChanged
+            self._player.stateChanged.connect(self._on_player_state_changed)
+            self._player.positionChanged.connect(self._on_position_changed)
+            self._player.durationChanged.connect(self._on_duration_changed)
+
+        if self._player.state() == QMediaPlayer.PlayingState:
+            self._player.pause()
+            self.play_btn.setText("▶")
+        else:
+            self._player.play()
+            self.play_btn.setText("⏸")
+
+    def _on_player_state_changed(self, state) -> None:
+        from PyQt5.QtMultimedia import QMediaPlayer
+        if state == QMediaPlayer.StoppedState:
+            self.play_btn.setText("▶")
+            self.waveform.setValue(0)
+
+    def _on_duration_changed(self, duration_ms: int) -> None:
+        self._duration_ms = max(1, duration_ms)
+
+    def _on_position_changed(self, pos_ms: int) -> None:
+        dur = getattr(self, "_duration_ms", 0)
+        if dur > 0:
+            val = int(pos_ms / dur * 1000)
+            self.waveform.setValue(min(1000, max(0, val)))

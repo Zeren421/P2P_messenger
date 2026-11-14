@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QColor, QPalette
 
 from connection_manager import ConnectionManager
-from widgets import MessageBubble, FileBubble, TypingIndicator, ImageViewer
+from widgets import MessageBubble, FileBubble, VoiceBubble, TypingIndicator, ImageViewer
 from helpers import (
     ClipboardHelper, FileSenderHelper, MessageRenderer, ScrollManager
 )
@@ -30,6 +30,7 @@ from helpers.history import (
     save_history, load_history, save_username, load_username,
     save_peer, load_peer, clear_history
 )
+from helpers.voice_recorder import VoiceRecorder
 
 # ============================================================
 #  ЛОГИРОВАНИЕ В ФАЙЛ
@@ -91,10 +92,14 @@ class ChatClient(QMainWindow):
         self.last_file_progress = {}
         self._file_is_own = {}
         self._last_progress_ui = {}
-        self.queued_file_ids = set()  # <--- НОВОЕ: храним ID файлов в очереди
+        self.queued_file_ids = set()
         self.last_typing_sent = 0
         self.running = True
         self._loading_history = False
+
+        # Голосовые сообщения
+        self._voice_recorder = VoiceRecorder()
+        self._recording_voice = False
 
         log.info("Initializing UI...")
         self.init_ui()
@@ -122,7 +127,7 @@ class ChatClient(QMainWindow):
 
     def init_ui(self):
         log.info("init_ui started")
-        self.setWindowTitle("Мессенджер v6.7 (P2P)")
+        self.setWindowTitle("Мессенджер v7.2 (P2P)")
         self.setGeometry(100, 100, 940, 720)
         self.setMinimumSize(700, 500)
 
@@ -295,12 +300,36 @@ class ChatClient(QMainWindow):
         """)
         self.attach_button.clicked.connect(self.attach_file)
 
+        # Кнопка 🎤 (запись голосового — клик = старт, повторный клик = стоп+отправка)
+        self.voice_button = QPushButton("🎤")
+        self.voice_button.setFixedSize(55, 55)
+        self.voice_button.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #ffffff;
+                border: 2px solid #444444;
+                border-radius: 16px;
+                font-size: 20px;
+            }
+            QPushButton:hover { background-color: #2d2d44; }
+            QPushButton:checked {
+                background-color: #ff6b6b;
+                border-color: #ff6b6b;
+                color: #ffffff;
+            }
+        """)
+        self.voice_button.setCheckable(True)
+        self.voice_button.clicked.connect(self._toggle_voice_record)
+        self.voice_button.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.voice_button.customContextMenuRequested.connect(self._cancel_voice_record)
+
         input_card = QFrame()
         input_card.setObjectName("inputCard")
         input_card.setStyleSheet("QFrame#inputCard { background-color: #050505; border: 1px solid #1c1c1c; border-radius: 20px; }")
         input_layout = QHBoxLayout(input_card)
         input_layout.setContentsMargins(10, 10, 10, 10)
         input_layout.addWidget(self.input_field, 4)
+        input_layout.addWidget(self.voice_button, 0)
         input_layout.addWidget(self.attach_button, 0)
         input_layout.addWidget(self.send_button, 1)
 
@@ -379,7 +408,6 @@ class ChatClient(QMainWindow):
                 except Exception as e:
                     log.warning(f"_add_file_bubble_to_chat: update_progress error: {e}")
 
-            # Если файл в очереди, сразу показываем плашку
             if file_id in self.queued_file_ids:
                 self.queued_file_ids.remove(file_id)
                 try:
@@ -583,18 +611,21 @@ class ChatClient(QMainWindow):
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
-        self.queued_file_ids.discard(file_id)  # <--- Чистим
+        self.queued_file_ids.discard(file_id)
 
     def _on_file_queued_gui(self, file_id, reason):
         bubble = self.active_file_bubbles.get(file_id)
         if bubble and hasattr(bubble, 'set_queued'):
             bubble.set_queued()
         else:
-            # Если bubble ещё не создан, запоминаем ID
-            self.queued_file_ids.add(file_id)  # <--- Запоминаем
+            self.queued_file_ids.add(file_id)
 
     def _on_file_received_gui(self, file_id, filename, save_path):
-        self.add_system_message(f"📥 Получен файл: {filename} (сохранён в {save_path})")
+        # Если это голосовое — не спамим системным сообщением
+        is_voice = "_voice" in filename and filename.endswith(".wav")
+        if not is_voice:
+            self.add_system_message(f"📥 Получен файл: {filename} (сохранён в {save_path})")
+
         bubble = self.active_file_bubbles.get(file_id)
         if bubble:
             bubble.set_file_path(save_path)
@@ -605,22 +636,38 @@ class ChatClient(QMainWindow):
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
-        self.queued_file_ids.discard(file_id)  # <--- Чистим
+        self.queued_file_ids.discard(file_id)
 
     def _on_file_info(self, file_id, filename, total_size, thumbnail, caption):
         log.info(f"_on_file_info: {filename}")
-        bubble = FileBubble(
-            sender_name=self.peer_name,
-            file_id=file_id,
-            filename=filename,
-            file_size=total_size,
-            thumbnail=thumbnail,
-            caption=caption,
-            is_own=False,
-            time_str=datetime.now().strftime("%H:%M"),
-            parent=self,
-            original_bytes=None,
-        )
+        is_voice = "_voice" in filename and filename.endswith(".wav")
+
+        if is_voice:
+            # Длительность из размера: 16 кГц, 16-bit, моно = 32000 байт/сек
+            duration = total_size / 88200
+            bubble = VoiceBubble(
+                sender_name=self.peer_name,
+                file_id=file_id,
+                filename=filename,
+                duration_sec=duration,
+                is_own=False,
+                time_str=datetime.now().strftime("%H:%M"),
+                parent=self,
+            )
+        else:
+            bubble = FileBubble(
+                sender_name=self.peer_name,
+                file_id=file_id,
+                filename=filename,
+                file_size=total_size,
+                thumbnail=thumbnail,
+                caption=caption,
+                is_own=False,
+                time_str=datetime.now().strftime("%H:%M"),
+                parent=self,
+                original_bytes=None,
+            )
+
         bubble.set_cancel_callback(self._on_file_cancel)
         self._add_file_bubble_to_chat(bubble, is_own=False)
         self.play_notification_sound()
@@ -636,6 +683,7 @@ class ChatClient(QMainWindow):
         self.input_field.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
         self.attach_button.setEnabled(enabled)
+        self.voice_button.setEnabled(enabled)
 
     def set_status(self, text, color=None):
         log.debug(f"set_status: {text}")
@@ -830,6 +878,9 @@ class ChatClient(QMainWindow):
     def closeEvent(self, event):
         log.info("closeEvent called")
         self.running = False
+        if self._recording_voice:
+            self._voice_recorder.cancel()
+            self._recording_voice = False
         if self.conn_manager is not None:
             try:
                 self.conn_manager.send_bye()
@@ -888,8 +939,66 @@ class ChatClient(QMainWindow):
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
-        self.queued_file_ids.discard(file_id)  # <--- Чистим
+        self.queued_file_ids.discard(file_id)
         self.add_system_message("❌ Передача файла отменена")
+
+    # ============================================================
+    #  Голосовые сообщения (запись)
+    # ============================================================
+
+    def _toggle_voice_record(self):
+        """Клик по 🎤: старт записи, повторный клик — стоп + отправка."""
+        if not self.connected:
+            self.voice_button.setChecked(False)
+            return
+
+        if not self._recording_voice:
+            # Старт
+            ok = self._voice_recorder.start()
+            if ok:
+                self._recording_voice = True
+                self.voice_button.setText("⏹")
+                self.voice_button.setChecked(True)
+                self.add_system_message("🎤 Запись... Нажмите ⏹ ещё раз, чтобы отправить")
+            else:
+                self.voice_button.setChecked(False)
+                QMessageBox.warning(self, "Ошибка", "Не удалось получить доступ к микрофону")
+        else:
+            # Стоп + отправка
+            self._recording_voice = False
+            self.voice_button.setText("🎤")
+            self.voice_button.setChecked(False)
+            path = self._voice_recorder.stop()
+            if not path:
+                self.add_system_message("⚠️ Запись слишком короткая")
+                return
+            try:
+                import wave
+                with wave.open(path, "rb") as wf:
+                    duration = wf.getnframes() / wf.getframerate()
+                if duration < 1.0:
+                    self.add_system_message("⚠️ Слишком коротко (минимум 1 сек)")
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                    return
+                new_path = path.replace(".wav", "_voice.wav")
+                os.rename(path, new_path)
+                self.file_sender.send_file_from_path(new_path)
+            except Exception as e:
+                log.error(f"_toggle_voice_record error: {e}")
+                self.add_system_message(f"❌ Ошибка: {e}")
+
+    def _cancel_voice_record(self):
+        """Отмена записи (правая кнопка мыши по 🎤)."""
+        if not self._recording_voice:
+            return
+        self._recording_voice = False
+        self.voice_button.setText("🎤")
+        self.voice_button.setChecked(False)
+        self._voice_recorder.cancel()
+        self.add_system_message("❌ Запись отменена")
 
     def clear_chat(self):
         log.info("clear_chat called")
@@ -910,7 +1019,7 @@ class ChatClient(QMainWindow):
             self.last_file_progress.clear()
             self._file_is_own.clear()
             self._last_progress_ui.clear()
-            self.queued_file_ids.clear()  # <--- Чистим
+            self.queued_file_ids.clear()
             clear_history()
             self.add_system_message("Чат очищен")
             self.scroll_manager._scroll_to_bottom()
