@@ -1,9 +1,5 @@
 """
-ConnectionManager — с надёжной доставкой FILE_INFO, FILE_CANCEL, chunk_seq=4 байта.
-
-Фикс (папки загрузок):
-  * Все принятые файлы складываются в downloads/, голосовые — в downloads/voice/.
-  * Папки создаются автоматически при connect().
+ConnectionManager — с голосовыми звонками (push-to-talk, PCM).
 """
 
 from __future__ import annotations
@@ -28,11 +24,15 @@ from protocol import (
     unpack_password, unpack_password_accept, unpack_password_reject,
     unpack_text, unpack_typing, unpack_file_chunk_ack_bitmap,
     unpack_file_cancel, pack_file_cancel, pack_file_info,
+    pack_voice_start, pack_voice_data, pack_voice_end,
+    pack_voice_accept, pack_voice_reject,
+    unpack_voice_call_id, unpack_voice_data,
 )
 from transport import ITransport
 from udp_transport import UdpTransport
 from relay_transport import RelayTransport
 from file_transfer import FileTransferManager
+from voice_call import VoiceCallSession
 
 
 @dataclass(slots=True)
@@ -61,6 +61,10 @@ class ConnectionManager:
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
         on_file_queued: Optional[Callable[[int, str], None]] = None,
+        on_call_incoming: Optional[Callable[[int], None]] = None,
+        on_call_accepted: Optional[Callable[[int], None]] = None,
+        on_call_rejected: Optional[Callable[[int], None]] = None,
+        on_call_ended: Optional[Callable[[int], None]] = None,
     ) -> None:
         self._my_topic = my_topic
         self._peer_topic = peer_topic
@@ -77,6 +81,10 @@ class ConnectionManager:
         self._on_file_error = on_file_error
         self._on_file_info = on_file_info
         self._on_file_queued = on_file_queued
+        self._on_call_incoming = on_call_incoming
+        self._on_call_accepted = on_call_accepted
+        self._on_call_rejected = on_call_rejected
+        self._on_call_ended = on_call_ended
 
         self._transport: Optional[ITransport] = None
         self._seq_lock = threading.Lock()
@@ -109,6 +117,7 @@ class ConnectionManager:
         self._ping_missed = 0
 
         self._file_manager: Optional[FileTransferManager] = None
+        self._voice_call: Optional[VoiceCallSession] = None
         self._reconnecting = False
 
     def set_password(self, password: str) -> None:
@@ -154,9 +163,6 @@ class ConnectionManager:
         self._ping_missed = 0
         self.send_pubkey()
 
-        # --- Создаём папки для загрузок ---
-        # connection_manager.py лежит в client/, поэтому поднимаемся на 2 уровня
-        # вверх, чтобы попасть в корень проекта (P2P_Messenger/)
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         downloads_root = os.path.join(project_root, "downloads")
         voice_dir = os.path.join(downloads_root, "voice")
@@ -164,7 +170,6 @@ class ConnectionManager:
         print(f"[CM] [INFO] Project root: {project_root}")
         print(f"[CM] [INFO] Downloads dir: {downloads_root}")
         print(f"[CM] [INFO] Voice dir: {voice_dir}")
-
 
         self._file_manager = FileTransferManager(
             send_raw=self._send_raw,
@@ -178,7 +183,7 @@ class ConnectionManager:
             on_file_info=self._on_file_info,
             on_file_queued=self._on_file_queued,
             downloads_dir=downloads_root,
-            voice_dir=voice_dir,   # <--- НОВЫЙ ПАРАМЕТР
+            voice_dir=voice_dir,
         )
         self._file_manager.start()
         return True
@@ -188,6 +193,9 @@ class ConnectionManager:
         self._reconnecting = False
         if self._retry_thread is not None:
             self._retry_thread.join(timeout=2.0)
+        if self._voice_call is not None:
+            self._voice_call.stop()
+            self._voice_call = None
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
@@ -213,9 +221,7 @@ class ConnectionManager:
     def _require_udp_for_files(self) -> None:
         if not isinstance(self._transport, UdpTransport):
             raise Exception(
-                "Передача файлов доступна только через прямое P2P-соединение (UDP). "
-                "Текущий транспорт — relay (ntfy), он не предназначен для файлов. "
-                "Попробуйте переподключиться, чтобы установить прямое соединение."
+                "Передача файлов доступна только через прямое P2P-соединение (UDP)."
             )
 
     def send_image_bytes(self, image_bytes: bytes, filename: str = "Скриншот.png",
@@ -245,6 +251,68 @@ class ConnectionManager:
             self._file_manager.cancel_send(file_id)
         else:
             self._file_manager.cancel_receive(file_id)
+
+    # === ЗВОНКИ ===
+
+    def start_call(self) -> bool:
+        """Начать исходящий звонок."""
+        if not isinstance(self._transport, UdpTransport):
+            self._status("Звонки доступны только через прямое P2P (UDP)")
+            return False
+        if self._voice_call is not None:
+            return False
+        self._voice_call = VoiceCallSession(
+            send_raw=self._send_raw,
+            next_seq=self._next_seq,
+            on_call_ended=self._on_call_ended_internal,
+        )
+        if not self._voice_call.start():
+            self._voice_call = None
+            return False
+        seq = self._next_seq()
+        self._send_raw(pack_voice_start(seq, self._voice_call.call_id))
+        self._status("Calling...")
+        return True
+
+    def accept_call(self) -> bool:
+        """Принять входящий звонок."""
+        if self._voice_call is None:
+            return False
+        seq = self._next_seq()
+        self._send_raw(pack_voice_accept(seq, self._voice_call.call_id))
+        self._status("Call accepted")
+        return True
+
+    def reject_call(self) -> None:
+        """Отклонить входящий звонок."""
+        if self._voice_call is not None:
+            seq = self._next_seq()
+            self._send_raw(pack_voice_reject(seq, self._voice_call.call_id))
+            self._voice_call.stop()
+            self._voice_call = None
+
+    def end_call(self) -> None:
+        """Завершить текущий звонок."""
+        if self._voice_call is not None:
+            seq = self._next_seq()
+            self._send_raw(pack_voice_end(seq, self._voice_call.call_id))
+            self._voice_call.stop()
+            self._voice_call = None
+
+    def start_talking(self) -> None:
+        if self._voice_call is not None:
+            self._voice_call.start_talking()
+
+    def stop_talking(self) -> None:
+        if self._voice_call is not None:
+            self._voice_call.stop_talking()
+
+    def is_in_call(self) -> bool:
+        return self._voice_call is not None
+
+    # ==========================================================
+    # Отправка
+    # ==========================================================
 
     def send_message(self, text: str) -> None:
         if self._crypto is None or not self._key_exchanged:
@@ -303,10 +371,6 @@ class ConnectionManager:
     def is_connected(self) -> bool:
         return self._transport is not None and self._transport.is_alive()
 
-    # ==========================================================
-    # Надёжный FILE_INFO
-    # ==========================================================
-
     def send_file_info_reliable(self, file_id: int, info_plaintext: bytes,
                                 on_ack: Callable[[], None],
                                 on_fail: Callable[[], None]) -> None:
@@ -319,10 +383,6 @@ class ConnectionManager:
             self._pending[seq] = PendingEntry("file_info", data, "", time.time(), 1)
             self._file_info_callbacks[seq] = (on_ack, on_fail)
         self._send_raw(data)
-
-    # ==========================================================
-    # Служебное
-    # ==========================================================
 
     def _next_seq(self) -> int:
         with self._seq_lock:
@@ -340,6 +400,15 @@ class ConnectionManager:
                 self._on_status(msg)
             except Exception:
                 pass
+
+    def _on_call_ended_internal(self) -> None:
+        """Колбэк из VoiceCallSession (когда звонок завершён локально)."""
+        if self._voice_call is not None:
+            cid = self._voice_call.call_id
+            self._voice_call = None
+            if self._on_call_ended:
+                try: self._on_call_ended(cid)
+                except Exception: pass
 
     # ==========================================================
     # Dispatch
@@ -370,32 +439,87 @@ class ConnectionManager:
             PacketType.FILE_CHUNK_ACK_BITMAP: self._handle_file_chunk_ack_bitmap,
             PacketType.FILE_DONE: self._handle_file_done,
             PacketType.FILE_CANCEL: self._handle_file_cancel,
+            # Голосовые
+            PacketType.VOICE_START: self._handle_voice_start,
+            PacketType.VOICE_DATA: self._handle_voice_data,
+            PacketType.VOICE_END: self._handle_voice_end,
+            PacketType.VOICE_ACCEPT: self._handle_voice_accept,
+            PacketType.VOICE_REJECT: self._handle_voice_reject,
         }.get(packet.type)
         if handler:
             handler(packet)
         elif packet.type != PacketType.HELLO:
             print(f"[CM] [WARN] Unknown packet type: {packet.type}")
 
-    # ==========================================================
-    # Обработчики протокола
-    # ==========================================================
+    # --- Голосовые обработчики ---
+
+    def _handle_voice_start(self, packet: Packet) -> None:
+        try:
+            call_id = unpack_voice_call_id(packet.payload)
+        except Exception:
+            return
+        # Если уже в звонке — отклонить
+        if self._voice_call is not None:
+            seq = self._next_seq()
+            self._send_raw(pack_voice_reject(seq, call_id))
+            return
+        # Принимаем автоматически (для MVP) или спрашиваем пользователя
+        self._voice_call = VoiceCallSession(
+            send_raw=self._send_raw,
+            next_seq=self._next_seq,
+            on_call_ended=self._on_call_ended_internal,
+        )
+        if self._voice_call.start():
+            self._voice_call.call_id = call_id
+            if self._on_call_incoming is not None:
+                try: self._on_call_incoming(call_id)
+                except Exception: pass
+        else:
+            self._voice_call = None
+
+    def _handle_voice_data(self, packet: Packet) -> None:
+        if self._voice_call is None:
+            return
+        try:
+            _call_id, _audio_seq, pcm = unpack_voice_data(packet.payload)
+            self._voice_call.on_voice_data(pcm)
+        except Exception as e:
+            print(f"[CM] Voice data error: {e}")
+
+    def _handle_voice_end(self, packet: Packet) -> None:
+        if self._voice_call is not None:
+            self._voice_call.stop()
+            self._voice_call = None
+            if self._on_call_ended is not None:
+                try: self._on_call_ended(0)
+                except Exception: pass
+
+    def _handle_voice_accept(self, packet: Packet) -> None:
+        if self._on_call_accepted is not None:
+            try: self._on_call_accepted(0)
+            except Exception: pass
+
+    def _handle_voice_reject(self, packet: Packet) -> None:
+        if self._voice_call is not None:
+            self._voice_call.stop()
+            self._voice_call = None
+        if self._on_call_rejected is not None:
+            try: self._on_call_rejected(0)
+            except Exception: pass
+
+    # --- Остальные обработчики (без изменений) ---
 
     def _handle_msg(self, packet: Packet) -> None:
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
-        if self._is_duplicate(packet.seq):
-            return
-        if self._crypto is None:
-            return
+        if self._is_duplicate(packet.seq): return
+        if self._crypto is None: return
         try:
             text = self._crypto.decrypt(packet.payload, packet.seq).decode()
-        except Exception as e:
-            print(f"[CM] [WARN] Decrypt failed: {e}")
+        except Exception:
             return
         if self._on_message is not None:
-            try:
-                self._on_message(text)
-            except Exception:
-                pass
+            try: self._on_message(text)
+            except Exception: pass
 
     def _handle_ack(self, packet: Packet) -> None:
         try:
@@ -407,10 +531,8 @@ class ConnectionManager:
             cb = self._file_info_callbacks.pop(acked_seq, None)
         if cb is not None:
             on_ack, _on_fail = cb
-            try:
-                on_ack()
-            except Exception as e:
-                print(f"[CM] file_info on_ack error: {e}")
+            try: on_ack()
+            except Exception as e: print(f"[CM] file_info on_ack error: {e}")
 
     def _handle_typing(self, packet: Packet) -> None:
         try:
@@ -418,10 +540,8 @@ class ConnectionManager:
         except ProtocolError:
             return
         if self._on_typing is not None:
-            try:
-                self._on_typing(is_typing, sender)
-            except Exception:
-                pass
+            try: self._on_typing(is_typing, sender)
+            except Exception: pass
 
     def _handle_name(self, packet: Packet) -> None:
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
@@ -430,15 +550,12 @@ class ConnectionManager:
         except ProtocolError:
             return
         if self._on_peer_name is not None:
-            try:
-                self._on_peer_name(name)
-            except Exception:
-                pass
+            try: self._on_peer_name(name)
+            except Exception: pass
 
     def _handle_pubkey(self, packet: Packet) -> None:
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
-        if self._key_exchanged or self._crypto is None:
-            return
+        if self._key_exchanged or self._crypto is None: return
         try:
             self._crypto.set_peer_public_key(unpack_pubkey(packet))
             self._key_exchanged = True
@@ -462,25 +579,21 @@ class ConnectionManager:
 
     def _handle_password(self, packet: Packet) -> None:
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
-        if self._crypto is None or not self._key_exchanged:
-            return
+        if self._crypto is None or not self._key_exchanged: return
         try:
             received = self._crypto.decrypt(unpack_password(packet), packet.seq).decode()
         except Exception:
             return
-
         if self._password is None or self._password == "":
             self._send_raw(pack_password_reject(self._next_seq(), "No password expected"))
             return
-
         if received == self._password:
             self._send_raw(pack_password_accept(self._next_seq()))
             self._password_verified = True
             if self._pending_messages:
                 msgs = self._pending_messages[:]
                 self._pending_messages.clear()
-                for text in msgs:
-                    self.send_message(text)
+                for text in msgs: self.send_message(text)
         else:
             self._send_raw(pack_password_reject(self._next_seq(), "Invalid password"))
 
@@ -490,8 +603,7 @@ class ConnectionManager:
         if self._pending_messages:
             msgs = self._pending_messages[:]
             self._pending_messages.clear()
-            for text in msgs:
-                self.send_message(text)
+            for text in msgs: self.send_message(text)
 
     def _handle_password_reject(self, packet: Packet) -> None:
         self._password_attempts += 1
@@ -523,80 +635,56 @@ class ConnectionManager:
         self._last_pong_time = time.time()
         self._ping_missed = 0
 
-    # ==========================================================
-    # Файловые пакеты
-    # ==========================================================
-
     def _handle_file_info(self, packet: Packet) -> None:
-        if self._file_manager is None or not self._key_exchanged or not self._password_verified:
-            return
+        if self._file_manager is None or not self._key_exchanged or not self._password_verified: return
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
         if not self._is_duplicate(packet.seq):
-            try:
-                self._file_manager.handle_file_info_packet(packet.seq, packet.payload)
-            except Exception as e:
-                print(f"[CM] File info error: {e}")
+            try: self._file_manager.handle_file_info_packet(packet.seq, packet.payload)
+            except Exception as e: print(f"[CM] File info error: {e}")
 
     def _handle_file_chunk(self, packet: Packet) -> None:
-        if self._file_manager is None or not self._key_exchanged or not self._password_verified:
-            return
+        if self._file_manager is None or not self._key_exchanged or not self._password_verified: return
         try:
-            if len(packet.payload) < 8:
-                return
+            if len(packet.payload) < 8: return
             file_id = int.from_bytes(packet.payload[:4], "big")
             chunk_seq = int.from_bytes(packet.payload[4:8], "big")
             encrypted = packet.payload[8:]
             self._file_manager.handle_file_chunk_packet(packet.seq, file_id, chunk_seq, encrypted)
-        except Exception as e:
-            print(f"[CM] File chunk error: {e}")
+        except Exception as e: print(f"[CM] File chunk error: {e}")
 
     def _handle_file_chunk_ack(self, packet: Packet) -> None:
-        if self._file_manager is None or not self._key_exchanged or not self._password_verified:
-            return
+        if self._file_manager is None or not self._key_exchanged or not self._password_verified: return
         try:
-            if len(packet.payload) < 8:
-                return
+            if len(packet.payload) < 8: return
             file_id = int.from_bytes(packet.payload[:4], "big")
             chunk_seq = int.from_bytes(packet.payload[4:8], "big")
             self._file_manager.handle_file_chunk_ack_packet(file_id, chunk_seq)
-        except Exception as e:
-            print(f"[CM] File ack error: {e}")
+        except Exception as e: print(f"[CM] File ack error: {e}")
 
     def _handle_file_chunk_ack_bitmap(self, packet: Packet) -> None:
         return
 
     def _handle_file_done(self, packet: Packet) -> None:
-        if self._file_manager is None or not self._key_exchanged or not self._password_verified:
-            return
+        if self._file_manager is None or not self._key_exchanged or not self._password_verified: return
         self._send_raw(pack_ack(self._next_seq(), packet.seq))
         try:
-            if len(packet.payload) < 4:
-                return
+            if len(packet.payload) < 4: return
             file_id = int.from_bytes(packet.payload[:4], "big")
             self._file_manager.handle_file_done_packet(file_id)
-        except Exception as e:
-            print(f"[CM] FILE_DONE error: {e}")
+        except Exception as e: print(f"[CM] FILE_DONE error: {e}")
 
     def _handle_file_cancel(self, packet: Packet) -> None:
-        if self._file_manager is None:
-            return
+        if self._file_manager is None: return
         try:
             file_id, by_sender = unpack_file_cancel(packet)
         except ProtocolError:
             return
-        if by_sender:
-            self._file_manager.abort_receive(file_id)
-        else:
-            self._file_manager.abort_send(file_id)
-
-    # ==========================================================
-    # Дедуп + ретраи + реконнект
-    # ==========================================================
+        if by_sender: self._file_manager.abort_receive(file_id)
+        else: self._file_manager.abort_send(file_id)
 
     def _is_duplicate(self, seq: int) -> bool:
         with self._dedup_lock:
-            if seq in self._seen_seqs_set:
-                return True
+            if seq in self._seen_seqs_set: return True
             if len(self._seen_seqs) >= self._seen_seqs.maxlen:
                 oldest = self._seen_seqs.popleft()
                 self._seen_seqs_set.discard(oldest)
@@ -640,23 +728,18 @@ class ConnectionManager:
                 items = list(self._pending.items())
 
             for seq, entry in items:
-                if now - entry.sent_at < RESEND_INTERVAL:
-                    continue
+                if now - entry.sent_at < RESEND_INTERVAL: continue
                 if entry.attempts >= MAX_RESEND_ATTEMPTS:
                     with self._pending_lock:
                         self._pending.pop(seq, None)
                         cb = self._file_info_callbacks.pop(seq, None)
                     if cb is not None:
                         _on_ack, on_fail = cb
-                        try:
-                            on_fail()
-                        except Exception as e:
-                            print(f"[CM] file_info on_fail error: {e}")
+                        try: on_fail()
+                        except Exception as e: print(f"[CM] file_info on_fail error: {e}")
                     if entry.kind == "msg" and self._on_message_failed is not None:
-                        try:
-                            self._on_message_failed(entry.text)
-                        except Exception:
-                            pass
+                        try: self._on_message_failed(entry.text)
+                        except Exception: pass
                     continue
                 self._send_raw(entry.data)
                 with self._pending_lock:
@@ -673,12 +756,10 @@ class ConnectionManager:
                 attempt += 1
                 self._status(f"Reconnect attempt {attempt}/{max_attempts}...")
                 time.sleep(2.0)
-                if not self._running:
-                    break
+                if not self._running: break
                 self.disconnect()
                 time.sleep(1.0)
-                if not self._running:
-                    break
+                if not self._running: break
                 if self.connect():
                     self._status("Reconnected successfully")
                     return

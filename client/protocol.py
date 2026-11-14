@@ -54,6 +54,12 @@ class PacketType(IntEnum):
     FILE_DONE = 0x13
     FILE_CHUNK_ACK_BITMAP = 0x14   # НОВЫЙ ТИП ДЛЯ КУМУЛЯТИВНЫХ ACK
     FILE_CANCEL = 0x15
+    # === ГОЛОСОВЫЕ ПАКЕТЫ ===
+    VOICE_START = 0x20
+    VOICE_DATA = 0x21
+    VOICE_END = 0x22
+    VOICE_ACCEPT = 0x23
+    VOICE_REJECT = 0x24
 
 class ProtocolError(Exception):
     """Некорректный или повреждённый пакет."""
@@ -263,3 +269,28 @@ def unpack_file_cancel(packet: Packet) -> tuple[int, bool]:
     if len(packet.payload) != 5:
         raise ProtocolError("Malformed FILE_CANCEL payload")
     return int.from_bytes(packet.payload[:4], "big"), packet.payload[4] == 1
+
+
+def pack_voice_start(seq: int, call_id: int) -> bytes:
+    return pack(PacketType.VOICE_START, seq, call_id.to_bytes(4, "big"))
+
+def pack_voice_data(seq: int, call_id: int, audio_seq: int, pcm_data: bytes) -> bytes:
+    payload = call_id.to_bytes(4, "big") + audio_seq.to_bytes(4, "big") + pcm_data
+    return pack(PacketType.VOICE_DATA, seq, payload)
+
+def pack_voice_end(seq: int, call_id: int) -> bytes:
+    return pack(PacketType.VOICE_END, seq, call_id.to_bytes(4, "big"))
+
+def pack_voice_accept(seq: int, call_id: int) -> bytes:
+    return pack(PacketType.VOICE_ACCEPT, seq, call_id.to_bytes(4, "big"))
+
+def pack_voice_reject(seq: int, call_id: int) -> bytes:
+    return pack(PacketType.VOICE_REJECT, seq, call_id.to_bytes(4, "big"))
+
+def unpack_voice_call_id(payload: bytes) -> int:
+    return int.from_bytes(payload[:4], "big")
+
+def unpack_voice_data(payload: bytes) -> tuple[int, int, bytes]:
+    call_id = int.from_bytes(payload[:4], "big")
+    audio_seq = int.from_bytes(payload[4:8], "big")
+    return call_id, audio_seq, payload[8:]

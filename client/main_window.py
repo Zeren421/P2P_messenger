@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QFrame, QScrollArea, QFileDialog, QMessageBox,
     QInputDialog, QSystemTrayIcon, QStyle, QGraphicsDropShadowEffect,
-    QLineEdit, QApplication
+    QLineEdit, QApplication, QDialog, QMessageBox as QMsgBox
 )
 from PyQt5.QtGui import QColor, QPalette
 
@@ -69,6 +69,11 @@ class ChatClient(QMainWindow):
     message_failed_signal = pyqtSignal(str)
     file_received_signal = pyqtSignal(int, str, str)
     file_queued_signal = pyqtSignal(int, str)
+    # Звонки
+    call_incoming_signal = pyqtSignal(int)
+    call_accepted_signal = pyqtSignal(int)
+    call_rejected_signal = pyqtSignal(int)
+    call_ended_signal = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -100,6 +105,8 @@ class ChatClient(QMainWindow):
         # Голосовые сообщения
         self._voice_recorder = VoiceRecorder()
         self._recording_voice = False
+        # Звонковое окно
+        self._call_dialog = None
 
         log.info("Initializing UI...")
         self.init_ui()
@@ -127,7 +134,7 @@ class ChatClient(QMainWindow):
 
     def init_ui(self):
         log.info("init_ui started")
-        self.setWindowTitle("Мессенджер v7.2 (P2P)")
+        self.setWindowTitle("Мессенджер v7.3 (P2P + Calls)")
         self.setGeometry(100, 100, 940, 720)
         self.setMinimumSize(700, 500)
 
@@ -175,6 +182,24 @@ class ChatClient(QMainWindow):
         self.reconnect_btn.clicked.connect(self.reconnect)
         self.reconnect_btn.setEnabled(False)
 
+        self.call_button = QPushButton("📞")
+        self.call_button.setFixedHeight(38)
+        self.call_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4caf50;
+                color: #ffffff;
+                border: none;
+                border-radius: 12px;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 0 14px;
+            }
+            QPushButton:hover { background-color: #66bb6a; }
+            QPushButton:disabled { background-color: #2d2d44; color: #666666; }
+        """)
+        self.call_button.clicked.connect(self._start_call)
+        self.call_button.setEnabled(False)
+
         self.clear_button = QPushButton("🗑 Очистить")
         self.clear_button.setFixedHeight(38)
         self.clear_button.setStyleSheet("""
@@ -195,6 +220,7 @@ class ChatClient(QMainWindow):
         header_layout.addWidget(self.status_dot)
         header_layout.addWidget(self.status_text)
         header_layout.addStretch(1)
+        header_layout.addWidget(self.call_button)
         header_layout.addWidget(self.reconnect_btn)
         header_layout.addWidget(self.clear_button)
 
@@ -300,7 +326,7 @@ class ChatClient(QMainWindow):
         """)
         self.attach_button.clicked.connect(self.attach_file)
 
-        # Кнопка 🎤 (запись голосового — клик = старт, повторный клик = стоп+отправка)
+        # Кнопка 🎤 (запись голосового)
         self.voice_button = QPushButton("🎤")
         self.voice_button.setFixedSize(55, 55)
         self.voice_button.setStyleSheet("""
@@ -369,6 +395,11 @@ class ChatClient(QMainWindow):
         self.message_failed_signal.connect(self._on_message_failed_gui)
         self.file_received_signal.connect(self._on_file_received_gui)
         self.file_queued_signal.connect(self._on_file_queued_gui)
+        # Звонки
+        self.call_incoming_signal.connect(self._on_call_incoming)
+        self.call_accepted_signal.connect(self._on_call_accepted)
+        self.call_rejected_signal.connect(self._on_call_rejected)
+        self.call_ended_signal.connect(self._on_call_ended)
         log.info("init_signals finished")
 
     # ============================================================
@@ -440,6 +471,10 @@ class ChatClient(QMainWindow):
             on_file_error=self._on_file_error_signal_emitter,
             on_file_info=self._on_file_info_callback,
             on_file_queued=self._on_file_queued_signal_emitter,
+            on_call_incoming=self._on_call_incoming_cb,
+            on_call_accepted=self._on_call_accepted_cb,
+            on_call_rejected=self._on_call_rejected_cb,
+            on_call_ended=self._on_call_ended_cb,
         )
         self.conn_manager.set_password(self.password)
         log.info("ConnectionManager created, starting connect thread")
@@ -453,6 +488,7 @@ class ChatClient(QMainWindow):
             self.connected = True
             self.conn_manager.send_name(self.my_username)
             self.set_send_enabled(True)
+            self.call_button.setEnabled(True)
             log.info("_do_connect: connected successfully, UI enabled")
         else:
             log.warning("_do_connect: connection failed")
@@ -462,6 +498,7 @@ class ChatClient(QMainWindow):
         self._last_manual_reconnect = time.time()
         self.connected = False
         self.set_send_enabled(False)
+        self.call_button.setEnabled(False)
         self.add_system_message("Переподключение...")
         threading.Thread(target=self._do_reconnect, daemon=True).start()
 
@@ -562,6 +599,17 @@ class ChatClient(QMainWindow):
 
     def _on_file_queued_signal_emitter(self, file_id, reason):
         self.file_queued_signal.emit(file_id, reason)
+
+    # --- Колбэки звонков (фоновый поток -> GUI) ---
+
+    def _on_call_incoming_cb(self, call_id: int):
+        self.call_incoming_signal.emit(call_id)
+    def _on_call_accepted_cb(self, call_id: int):
+        self.call_accepted_signal.emit(call_id)
+    def _on_call_rejected_cb(self, call_id: int):
+        self.call_rejected_signal.emit(call_id)
+    def _on_call_ended_cb(self, call_id: int):
+        self.call_ended_signal.emit(call_id)
 
     # ============================================================
     #  Обработчики сигналов (GUI-поток)
@@ -673,6 +721,70 @@ class ChatClient(QMainWindow):
         self.play_notification_sound()
         if not self.isActiveWindow():
             self.show_tray_notification("📎 Получен файл", filename)
+
+    # ============================================================
+    #  Звонки (GUI)
+    # ============================================================
+
+    def _start_call(self):
+        """Начать исходящий звонок."""
+        if self.conn_manager is None or not self.connected:
+            return
+        if self._connection_type != "udp":
+            QMessageBox.warning(self, "Звонки", "Звонки доступны только через прямое P2P-соединение (UDP).\n\nСейчас вы подключены через relay (ntfy), который не подходит для голоса.")
+            return
+        if self.conn_manager.is_in_call():
+            QMessageBox.information(self, "Звонки", "Вы уже в звонке")
+            return
+        if self.conn_manager.start_call():
+            self.add_system_message("📞 Звонок...")
+            self._open_call_dialog()
+        else:
+            QMessageBox.warning(self, "Звонки", "Не удалось начать звонок (микрофон/динамики недоступны)")
+
+    def _on_call_incoming(self, call_id: int):
+        """Входящий звонок. Спрашиваем пользователя."""
+        self.play_notification_sound()
+        reply = QMessageBox.question(
+            self, "Входящий звонок",
+            f"📞 Звонок от {self.peer_name}.\nПринять?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            if self.conn_manager.accept_call():
+                self.add_system_message("📞 Звонок принят")
+                self._open_call_dialog()
+            else:
+                QMessageBox.warning(self, "Звонки", "Не удалось принять звонок")
+        else:
+            self.conn_manager.reject_call()
+            self.add_system_message("📞 Звонок отклонён")
+
+    def _on_call_accepted(self, call_id: int):
+        """Собеседник принял наш звонок."""
+        self.add_system_message("📞 Собеседник принял звонок")
+        self._open_call_dialog()
+
+    def _on_call_rejected(self, call_id: int):
+        self.add_system_message("📞 Собеседник отклонил звонок")
+        self._close_call_dialog()
+
+    def _on_call_ended(self, call_id: int):
+        self.add_system_message("📞 Звонок завершён")
+        self._close_call_dialog()
+
+    def _open_call_dialog(self):
+        """Открывает окно звонка с push-to-talk."""
+        if self._call_dialog is not None:
+            return
+        self._call_dialog = CallDialog(self, self.conn_manager)
+        self._call_dialog.show()
+
+    def _close_call_dialog(self):
+        if self._call_dialog is not None:
+            self._call_dialog.close()
+            self._call_dialog = None
 
     # ============================================================
     #  UI-методы
@@ -883,6 +995,8 @@ class ChatClient(QMainWindow):
             self._recording_voice = False
         if self.conn_manager is not None:
             try:
+                if self.conn_manager.is_in_call():
+                    self.conn_manager.end_call()
                 self.conn_manager.send_bye()
             except Exception as e:
                 log.warning(f"closeEvent: send_bye error: {e}")
@@ -947,13 +1061,11 @@ class ChatClient(QMainWindow):
     # ============================================================
 
     def _toggle_voice_record(self):
-        """Клик по 🎤: старт записи, повторный клик — стоп + отправка."""
         if not self.connected:
             self.voice_button.setChecked(False)
             return
 
         if not self._recording_voice:
-            # Старт
             ok = self._voice_recorder.start()
             if ok:
                 self._recording_voice = True
@@ -964,7 +1076,6 @@ class ChatClient(QMainWindow):
                 self.voice_button.setChecked(False)
                 QMessageBox.warning(self, "Ошибка", "Не удалось получить доступ к микрофону")
         else:
-            # Стоп + отправка
             self._recording_voice = False
             self.voice_button.setText("🎤")
             self.voice_button.setChecked(False)
@@ -991,7 +1102,6 @@ class ChatClient(QMainWindow):
                 self.add_system_message(f"❌ Ошибка: {e}")
 
     def _cancel_voice_record(self):
-        """Отмена записи (правая кнопка мыши по 🎤)."""
         if not self._recording_voice:
             return
         self._recording_voice = False
@@ -1023,3 +1133,77 @@ class ChatClient(QMainWindow):
             clear_history()
             self.add_system_message("Чат очищен")
             self.scroll_manager._scroll_to_bottom()
+
+
+# ============================================================
+#  Окно звонка (push-to-talk)
+# ============================================================
+
+class CallDialog(QDialog):
+    def __init__(self, parent, conn_manager):
+        super().__init__(parent)
+        self.conn_manager = conn_manager
+        self.setWindowTitle("📞 Звонок")
+        self.setFixedSize(300, 220)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet("QDialog { background-color: #0a0a0a; }")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        self.status_label = QLabel("📞 В звонке")
+        self.status_label.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.talk_btn = QPushButton("🎤 Говорить (нажми)")
+        self.talk_btn.setFixedHeight(60)
+        self.talk_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4caf50;
+                color: white;
+                border: none;
+                border-radius: 12px;
+                font-size: 16px;
+                font-weight: bold;
+            }
+            QPushButton:pressed { background-color: #2e7d32; }
+        """)
+        self.talk_btn.pressed.connect(self._on_talk_pressed)
+        self.talk_btn.released.connect(self._on_talk_released)
+        layout.addWidget(self.talk_btn)
+
+        self.end_btn = QPushButton("Завершить")
+        self.end_btn.setFixedHeight(45)
+        self.end_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6b6b;
+                color: white;
+                border: none;
+                border-radius: 12px;
+                font-size: 15px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #ff5252; }
+        """)
+        self.end_btn.clicked.connect(self._on_end)
+        layout.addWidget(self.end_btn)
+
+    def _on_talk_pressed(self):
+        self.talk_btn.setText("🎤 Говорю...")
+        self.conn_manager.start_talking()
+
+    def _on_talk_released(self):
+        self.talk_btn.setText("🎤 Говорить (нажми)")
+        self.conn_manager.stop_talking()
+
+    def _on_end(self):
+        self.conn_manager.end_call()
+        self.close()
+
+    def closeEvent(self, event):
+        # Если окно закрывают крестиком — завершаем звонок
+        if self.conn_manager.is_in_call():
+            self.conn_manager.end_call()
+        event.accept()
