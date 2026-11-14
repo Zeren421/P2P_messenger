@@ -9,6 +9,10 @@ ConnectionManager — с надёжной доставкой FILE_INFO, FILE_CAN
   * _handle_file_chunk_ack_bitmap теперь no-op: v2 file_transfer использует
     кумулятивный ACK, bitmap не поддерживает. Заглушка на случай старого
     клиента на другой стороне (раньше был AttributeError).
+
+Фикс (очередь файлов):
+  * Добавлен колбэк on_file_queued для отображения статуса "В очереди"
+    в FileBubble (фикс 5).
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ class ConnectionManager:
         on_file_progress: Optional[Callable[[int, float, bool], None]] = None,
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
+        on_file_queued: Optional[Callable[[int, str], None]] = None,  # НОВЫЙ КОЛБЭК
     ) -> None:
         self._my_topic = my_topic
         self._peer_topic = peer_topic
@@ -79,6 +84,7 @@ class ConnectionManager:
         self._on_file_progress = on_file_progress
         self._on_file_error = on_file_error
         self._on_file_info = on_file_info
+        self._on_file_queued = on_file_queued
 
         self._transport: Optional[ITransport] = None
         self._seq_lock = threading.Lock()
@@ -166,6 +172,7 @@ class ConnectionManager:
             on_file_received=self._on_file_received,
             on_file_error=self._on_file_error,
             on_file_info=self._on_file_info,
+            on_file_queued=self._on_file_queued,  # <--- ПРОКИДЫВАЕМ СЮДА
             downloads_dir=".",
         )
         self._file_manager.start()
@@ -213,7 +220,6 @@ class ConnectionManager:
             raise Exception("Connection not established")
         if self._crypto is None or not self._key_exchanged or not self._password_verified:
             raise Exception("Encryption not ready")
-        # ← ФИКС БАГА №2
         self._require_udp_for_files()
         return self._file_manager.send_memory_file(
             data=image_bytes, filename=filename, caption=caption, thumbnail=None,
@@ -225,7 +231,6 @@ class ConnectionManager:
             raise Exception("Connection not established")
         if self._crypto is None or not self._key_exchanged or not self._password_verified:
             raise Exception("Encryption not ready")
-        # ← ФИКС БАГА №2
         self._require_udp_for_files()
         return self._file_manager.send_file(filepath, caption, thumbnail)
 
@@ -554,9 +559,6 @@ class ConnectionManager:
             print(f"[CM] File ack error: {e}")
 
     def _handle_file_chunk_ack_bitmap(self, packet: Packet) -> None:
-        # ← ФИКС БАГА №3: v2 file_transfer использует кумулятивный ACK,
-        # bitmap не поддерживается. Заглушка — на случай старого клиента
-        # на другой стороне. Раньше был AttributeError на отсутствующий метод.
         return
 
     def _handle_file_done(self, packet: Packet) -> None:

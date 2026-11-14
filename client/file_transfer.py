@@ -1,11 +1,5 @@
 """
-FileTransferManager v2 — с мгновенными ACK-ами и последовательной записью на диск.
-
-Фикс (ACK starvation):
-  * Убран ACK_INTERVAL — ACK шлётся на КАЖДЫЙ чанк.
-  * Раньше throttle 5 мс приводил к тому, что отправитель слал пачку,
-    получатель отвечал одним ACK, отправитель ждал RTO, окно схлопывалось
-    до минимума, скорость падала 73 -> 30 -> 18 КБ/с.
+FileTransferManager v2 — с очередью передач и очищенной логикой ACK.
 """
 
 from __future__ import annotations
@@ -14,7 +8,7 @@ import os
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Dict, Set
+from typing import Callable, Optional, Dict, Set, List
 from io import BytesIO
 
 from protocol import (
@@ -27,26 +21,22 @@ from protocol import (
 # ============================================================
 
 CHUNK_SIZE = 1200
-
 INITIAL_WINDOW_BYTES = 64 * 1024
 MAX_WINDOW_BYTES     = 16 * 1024 * 1024
-MIN_WINDOW_BYTES     = 8 * 1024
+MIN_WINDOW_BYTES     = 64 * 1024
 
 RTO_INITIAL = 0.5
 RTO_MIN = 0.1
 RTO_MAX = 5.0
 
 FAST_RETRANSMIT_THRESHOLD = 3
-MAX_CHUNK_ATTEMPTS = 30       # было 12 — на всякий случай повыше
-MAX_CONCURRENT_TRANSFERS = 1
+MAX_CHUNK_ATTEMPTS = 1000
+MAX_CONCURRENT_TRANSFERS = 3
 
 PROGRESS_INTERVAL = 0.1
-ACK_NOTHING = 0xFFFFFFFF
-
 
 class FileTransferError(Exception):
     pass
-
 
 # ============================================================
 # Бинарный FILE_INFO
@@ -60,7 +50,7 @@ def build_file_info_payload(file_id, filename, total_size, caption, thumbnail) -
     return (
         file_id.to_bytes(4, "big")
         + len(filename_bytes).to_bytes(2, "big") + filename_bytes
-        + total_size.to_bytes(8, "big")  # <--- 8 БАЙТ ВМЕСТО 4
+        + total_size.to_bytes(8, "big")  # 8 байт
         + len(caption_bytes).to_bytes(2, "big") + caption_bytes
         + len(thumbnail).to_bytes(2, "big") + thumbnail
     )
@@ -70,7 +60,7 @@ def parse_file_info_payload(data: bytes):
     file_id = int.from_bytes(data[o:o+4], "big"); o += 4
     nl = int.from_bytes(data[o:o+2], "big"); o += 2
     filename = data[o:o+nl].decode("utf-8", "replace"); o += nl
-    total_size = int.from_bytes(data[o:o+8], "big"); o += 8  # <--- 8 БАЙТ ВМЕСТО 4
+    total_size = int.from_bytes(data[o:o+8], "big"); o += 8
     cl = int.from_bytes(data[o:o+2], "big"); o += 2
     caption = data[o:o+cl].decode("utf-8", "replace"); o += cl
     tl = int.from_bytes(data[o:o+2], "big"); o += 2
@@ -85,7 +75,6 @@ def generate_thumbnail_from_file(filepath: str, max_size: int = 200) -> bytes:
     except Exception:
         return b""
 
-
 def generate_thumbnail_from_bytes(data: bytes, max_size: int = 200) -> bytes:
     try:
         from PIL import Image
@@ -93,7 +82,6 @@ def generate_thumbnail_from_bytes(data: bytes, max_size: int = 200) -> bytes:
         return _thumb_from_image(img, max_size)
     except Exception:
         return b""
-
 
 def _thumb_from_image(img, max_size):
     from PIL import Image
@@ -110,7 +98,6 @@ def _thumb_from_image(img, max_size):
     img.save(buf, format="JPEG", quality=50)
     return buf.getvalue()
 
-
 # ============================================================
 # Состояние
 # ============================================================
@@ -123,7 +110,6 @@ class OutgoingChunk:
     attempts: int = 1
     retransmitted: bool = False
 
-
 @dataclass
 class SendingFile:
     file_id: int
@@ -132,26 +118,21 @@ class SendingFile:
     thumbnail: bytes
     total_size: int
     total_chunks: int
-
     file_handle: Optional[object] = None
     memory_data: Optional[bytes] = None
 
     window_bytes: int = INITIAL_WINDOW_BYTES
     ssthresh: int = MAX_WINDOW_BYTES
     in_slow_start: bool = True
-
     next_chunk: int = 0
     highest_acked: int = -1
     inflight: Dict[int, OutgoingChunk] = field(default_factory=dict)
     dup_ack_count: int = 0
-
     srtt: Optional[float] = None
     rttvar: float = 0.0
-
     cancelled: bool = False
     file_info_acked: bool = False
     done_sent: bool = False
-
     last_progress_emit: float = 0.0
 
     def total_acked_bytes(self) -> int:
@@ -163,7 +144,6 @@ class SendingFile:
             try: self.file_handle.close()
             except: pass
             self.file_handle = None
-
 
 @dataclass
 class ReceivingFile:
@@ -178,20 +158,16 @@ class ReceivingFile:
 
     next_write_chunk: int = 0
     pending_chunks: Dict[int, bytes] = field(default_factory=dict)
-
     started_at: float = field(default_factory=time.time)
     done_sent: bool = False
-
     last_progress_emit: float = 0.0
 
     def is_complete(self) -> bool:
         return self.next_write_chunk >= self.total_chunks
 
     def write_chunk(self, chunk_seq: int, data: bytes) -> None:
-        if self.file_handle is None:
-            return
-        if chunk_seq < self.next_write_chunk:
-            return
+        if self.file_handle is None: return
+        if chunk_seq < self.next_write_chunk: return
         self.pending_chunks[chunk_seq] = data
         while self.next_write_chunk in self.pending_chunks:
             next_data = self.pending_chunks.pop(self.next_write_chunk)
@@ -204,7 +180,6 @@ class ReceivingFile:
             try: self.file_handle.close()
             except: pass
             self.file_handle = None
-
 
 # ============================================================
 # Менеджер
@@ -223,6 +198,7 @@ class FileTransferManager:
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
         on_file_cancelled: Optional[Callable[[int, bool], None]] = None,
+        on_file_queued: Optional[Callable[[int, str], None]] = None, # НОВЫЙ КОЛБЭК
         downloads_dir: str = ".",
     ) -> None:
         self._send_raw = send_raw
@@ -235,11 +211,13 @@ class FileTransferManager:
         self._on_file_error = on_file_error
         self._on_file_info = on_file_info
         self._on_file_cancelled = on_file_cancelled
+        self._on_file_queued = on_file_queued
         self._downloads_dir = downloads_dir
 
         self._lock = threading.Lock()
         self._outgoing: Dict[int, SendingFile] = {}
         self._incoming: Dict[int, ReceivingFile] = {}
+        self._queued_transfers: List[SendingFile] = []
         self._next_file_id = 1
 
         self._running = False
@@ -257,86 +235,84 @@ class FileTransferManager:
         with self._lock:
             for f in self._outgoing.values(): f.close_file()
             for f in self._incoming.values(): f.close_file()
+            for f in self._queued_transfers: f.close_file()
             self._outgoing.clear()
             self._incoming.clear()
+            self._queued_transfers.clear()
 
-    def send_file(self, filepath: str, caption: str = "",
-                  thumbnail: Optional[bytes] = None) -> int:
+    def send_file(self, filepath: str, caption: str = "", thumbnail: Optional[bytes] = None) -> int:
         if not os.path.isfile(filepath):
             raise FileTransferError(f"File not found: {filepath}")
         total_size = os.path.getsize(filepath)
         if total_size == 0:
             raise FileTransferError("File is empty")
-        if total_size > 50 * 1024 * 1024 * 1024:  # 50 ГБ
+        if total_size > 50 * 1024 * 1024 * 1024:
             raise FileTransferError("File too large (max 50 GB)")
+
         if thumbnail is None:
             thumbnail = generate_thumbnail_from_file(filepath)
 
         with self._lock:
-            active = sum(1 for f in self._outgoing.values() if not f.cancelled)
-            if active >= MAX_CONCURRENT_TRANSFERS:
-                raise FileTransferError("Another transfer in progress")
             file_id = self._next_file_id
             self._next_file_id += 1
+            active = sum(1 for f in self._outgoing.values() if not f.cancelled)
+            must_queue = active >= MAX_CONCURRENT_TRANSFERS
 
         try:
             fh = open(filepath, "rb")
         except OSError as e:
             raise FileTransferError(f"Failed to open file: {e}")
 
-        sending = self._make_sending(
-            file_id=file_id,
-            filename=os.path.basename(filepath),
-            caption=caption,
-            thumbnail=thumbnail or b"",
-            total_size=total_size,
-            file_handle=fh,
+        total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        sending = SendingFile(
+            file_id=file_id, filename=os.path.basename(filepath),
+            caption=caption, thumbnail=thumbnail or b"",
+            total_size=total_size, total_chunks=total_chunks, file_handle=fh,
         )
-        self._start_sending(sending)
+        
+        if must_queue:
+            with self._lock:
+                self._queued_transfers.append(sending)
+            if self._on_file_queued:
+                try: self._on_file_queued(sending.file_id, "В очереди (начнётся после завершения текущих)")
+                except Exception: pass
+        else:
+            self._start_sending(sending)
         return file_id
 
-    def send_memory_file(self, data: bytes, filename: str,
-                         caption: str = "", thumbnail: Optional[bytes] = None) -> int:
+    def send_memory_file(self, data: bytes, filename: str, caption: str = "", thumbnail: Optional[bytes] = None) -> int:
         total_size = len(data)
         if total_size == 0:
             raise FileTransferError("Data is empty")
-        if total_size > 50 * 1024 * 1024 * 1024:  # 50 ГБ
+        if total_size > 50 * 1024 * 1024 * 1024:
             raise FileTransferError("File too large (max 50 GB)")
+
         if thumbnail is None:
             thumbnail = generate_thumbnail_from_bytes(data)
 
         with self._lock:
-            active = sum(1 for f in self._outgoing.values() if not f.cancelled)
-            if active >= MAX_CONCURRENT_TRANSFERS:
-                raise FileTransferError("Another transfer in progress")
             file_id = self._next_file_id
             self._next_file_id += 1
+            active = sum(1 for f in self._outgoing.values() if not f.cancelled)
+            must_queue = active >= MAX_CONCURRENT_TRANSFERS
 
-        sending = self._make_sending(
-            file_id=file_id,
-            filename=filename,
-            caption=caption,
-            thumbnail=thumbnail or b"",
-            total_size=total_size,
-            file_handle=BytesIO(data),
-            memory_data=data,
-        )
-        self._start_sending(sending)
-        return file_id
-
-    def _make_sending(self, file_id, filename, caption, thumbnail,
-                      total_size, file_handle, memory_data=None) -> SendingFile:
         total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-        return SendingFile(
-            file_id=file_id,
-            filename=filename,
-            caption=caption,
-            thumbnail=thumbnail,
-            total_size=total_size,
-            total_chunks=total_chunks,
-            file_handle=file_handle,
-            memory_data=memory_data,
+        sending = SendingFile(
+            file_id=file_id, filename=filename,
+            caption=caption, thumbnail=thumbnail or b"",
+            total_size=total_size, total_chunks=total_chunks, 
+            file_handle=BytesIO(data), memory_data=data,
         )
+
+        if must_queue:
+            with self._lock:
+                self._queued_transfers.append(sending)
+            if self._on_file_queued:
+                try: self._on_file_queued(sending.file_id, "В очереди (начнётся после завершения текущих)")
+                except Exception: pass
+        else:
+            self._start_sending(sending)
+        return file_id
 
     def _start_sending(self, sending: SendingFile) -> None:
         with self._lock:
@@ -360,6 +336,14 @@ class FileTransferManager:
                 enc = self._encrypt(info, seq)
                 self._send_raw(pack_file_info(seq, enc))
             self._on_file_info_acked(sending.file_id)
+
+    def _try_start_next_queued(self) -> None:
+        with self._lock:
+            active = sum(1 for f in self._outgoing.values() if not f.cancelled)
+            if active >= MAX_CONCURRENT_TRANSFERS or not self._queued_transfers:
+                return
+            sending = self._queued_transfers.pop(0)
+        self._start_sending(sending)
 
     def _on_file_info_acked(self, file_id: int) -> None:
         with self._lock:
@@ -388,12 +372,18 @@ class FileTransferManager:
     def _abort_send(self, file_id: int) -> bool:
         with self._lock:
             s = self._outgoing.pop(file_id, None)
+            if s is None:
+                for i, qs in enumerate(self._queued_transfers):
+                    if qs.file_id == file_id:
+                        s = self._queued_transfers.pop(i)
+                        break
         if s is None: return False
         s.cancelled = True
         s.close_file()
         if self._on_file_cancelled:
             try: self._on_file_cancelled(file_id, True)
             except Exception: pass
+        self._try_start_next_queued()
         return True
 
     def _abort_receive(self, file_id: int) -> bool:
@@ -408,18 +398,13 @@ class FileTransferManager:
             except Exception: pass
         return True
 
-    def _maybe_emit_progress(self, file_id: int, ratio: float,
-                             is_outgoing: bool, state_obj) -> None:
-        if self._on_progress is None:
-            return
+    def _maybe_emit_progress(self, file_id: int, ratio: float, is_outgoing: bool, state_obj) -> None:
+        if self._on_progress is None: return
         now = time.time()
-        if ratio < 1.0 and now - state_obj.last_progress_emit < PROGRESS_INTERVAL:
-            return
+        if ratio < 1.0 and now - state_obj.last_progress_emit < PROGRESS_INTERVAL: return
         state_obj.last_progress_emit = now
-        try:
-            self._on_progress(file_id, ratio, is_outgoing)
-        except Exception:
-            pass
+        try: self._on_progress(file_id, ratio, is_outgoing)
+        except Exception: pass
 
     def handle_file_info_packet(self, seq: int, payload: bytes) -> None:
         try:
@@ -436,15 +421,14 @@ class FileTransferManager:
                 try: self._on_file_error(file_id, "File too large (max 50 GB)")
                 except Exception: pass
             return
+
         with self._lock:
-            if file_id in self._incoming:
-                return
+            if file_id in self._incoming: return
 
         safe_name = os.path.basename(filename) or f"file_{file_id}"
         save_path = self._unique_save_path(safe_name)
         try:
             fh = open(save_path, "w+b")
-            fh.truncate(total_size)
         except OSError as e:
             if self._on_file_error:
                 try: self._on_file_error(file_id, f"Failed to create file: {e}")
@@ -464,16 +448,13 @@ class FileTransferManager:
             try: self._on_file_info(file_id, safe_name, total_size, thumbnail, caption)
             except Exception as e: print(f"[FT] on_file_info error: {e}")
 
-    def handle_file_chunk_packet(self, seq: int, file_id: int,
-                                 chunk_seq: int, encrypted_data: bytes) -> None:
+    def handle_file_chunk_packet(self, seq: int, file_id: int, chunk_seq: int, encrypted_data: bytes) -> None:
         with self._lock:
             incoming = self._incoming.get(file_id)
 
-        if incoming is None:
-            return
-
+        if incoming is None: return
         if chunk_seq < incoming.next_write_chunk or chunk_seq in incoming.pending_chunks:
-            self._send_ack(incoming)  # дубликат — просто ACK-аем
+            self._send_ack(incoming)
             return
 
         try:
@@ -489,7 +470,7 @@ class FileTransferManager:
                 except Exception: pass
             return
 
-        self._send_ack(incoming)  # ACK на КАЖДЫЙ чанк
+        self._send_ack(incoming)
 
         if not incoming.is_complete():
             got = min(incoming.next_write_chunk, incoming.total_chunks) * CHUNK_SIZE
@@ -501,34 +482,14 @@ class FileTransferManager:
             self._finish_incoming(incoming)
 
     def handle_file_chunk_ack_packet(self, file_id: int, cumulative_ack: int) -> None:
-        if cumulative_ack == ACK_NOTHING:
-            with self._lock:
-                sending = self._outgoing.get(file_id)
-                if sending is None or sending.cancelled:
-                    return
-                sending.dup_ack_count += 1
-                if sending.dup_ack_count == FAST_RETRANSMIT_THRESHOLD:
-                    chunk = sending.inflight.get(0)
-                    if chunk and not chunk.retransmitted:
-                        chunk.retransmitted = True
-                        chunk.attempts += 1
-                        chunk.last_sent_at = time.time()
-                        self._send_chunk_data(sending, 0, chunk)
-                        sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
-                        sending.ssthresh = sending.window_bytes
-                        sending.in_slow_start = False
-            return
-
+        # ФИКС 4: Убран блок if cumulative_ack == ACK_NOTHING
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is None or sending.cancelled:
-                return
+            if sending is None or sending.cancelled: return
 
             now = time.time()
-
             if cumulative_ack > sending.highest_acked:
                 sending.highest_acked = cumulative_ack
-
                 chunk = sending.inflight.get(cumulative_ack)
                 if chunk and not chunk.retransmitted:
                     sample = now - chunk.first_sent_at
@@ -539,17 +500,13 @@ class FileTransferManager:
                     del sending.inflight[s]
 
                 sending.dup_ack_count = 0
-
                 if sending.in_slow_start:
                     sending.window_bytes += CHUNK_SIZE
                     if sending.window_bytes >= sending.ssthresh:
                         sending.in_slow_start = False
                 else:
-                    sending.window_bytes += max(
-                        1, (CHUNK_SIZE * CHUNK_SIZE) // sending.window_bytes
-                    )
+                    sending.window_bytes += max(1, (CHUNK_SIZE * CHUNK_SIZE) // sending.window_bytes)
                 sending.window_bytes = min(sending.window_bytes, MAX_WINDOW_BYTES)
-
             else:
                 sending.dup_ack_count += 1
                 if sending.dup_ack_count == FAST_RETRANSMIT_THRESHOLD:
@@ -586,6 +543,7 @@ class FileTransferManager:
             if sending is not None:
                 sending.close_file()
                 self._outgoing.pop(file_id, None)
+        self._try_start_next_queued() # ФИКС 5
 
     @staticmethod
     def _update_rtt(sending: SendingFile, sample: float) -> None:
@@ -598,8 +556,7 @@ class FileTransferManager:
 
     @staticmethod
     def _current_rto(sending: SendingFile) -> float:
-        if sending.srtt is None:
-            return RTO_INITIAL
+        if sending.srtt is None: return RTO_INITIAL
         rto = sending.srtt + 4.0 * sending.rttvar
         return max(RTO_MIN, min(RTO_MAX, rto))
 
@@ -613,15 +570,13 @@ class FileTransferManager:
         return cand
 
     def _finish_incoming(self, incoming: ReceivingFile) -> None:
-        if incoming.done_sent:
-            return
+        if incoming.done_sent: return
         incoming.done_sent = True
         incoming.close_file()
         with self._lock:
             self._incoming.pop(incoming.file_id, None)
 
         self._send_raw(pack_file_done(self._next_seq(), incoming.file_id))
-
         if self._on_file_received:
             try: self._on_file_received(incoming.file_id, incoming.filename, incoming.save_path)
             except Exception: pass
@@ -630,10 +585,11 @@ class FileTransferManager:
             except Exception: pass
 
     def _send_ack(self, incoming: ReceivingFile) -> None:
-        """Шлёт ACK на каждый чанк. Без throttle — иначе отправитель
-        будет ждать ACK до RTO и схлопывать окно."""
+        # ФИКС 4: Не шлём ACK, если ничего не получили
+        if incoming.next_write_chunk == 0:
+            return
         seq = self._next_seq()
-        val = incoming.next_write_chunk - 1 if incoming.next_write_chunk > 0 else ACK_NOTHING
+        val = incoming.next_write_chunk - 1
         self._send_raw(pack_file_chunk_ack(seq, incoming.file_id, val))
 
     def _send_chunk_data(self, sending: SendingFile, chunk_seq: int, meta: OutgoingChunk) -> bool:
@@ -653,54 +609,49 @@ class FileTransferManager:
         ok = self._send_raw(pack_file_chunk(seq, payload))
         if ok:
             now = time.time()
-            if meta.first_sent_at == 0:
-                meta.first_sent_at = now
+            if meta.first_sent_at == 0: meta.first_sent_at = now
             meta.last_sent_at = now
         return ok
 
     def _kick_window(self, file_id: int) -> None:
         with self._lock:
             sending = self._outgoing.get(file_id)
-            if sending is None or sending.cancelled or not sending.file_info_acked:
-                return
+            if sending is None or sending.cancelled or not sending.file_info_acked: return
 
             inflight_bytes = len(sending.inflight) * CHUNK_SIZE
+            sent_now = 0
 
             while (inflight_bytes + CHUNK_SIZE <= sending.window_bytes
-                   and sending.next_chunk < sending.total_chunks):
+                   and sending.next_chunk < sending.total_chunks
+                   and sent_now < 200):
                 cs = sending.next_chunk
                 meta = OutgoingChunk(chunk_seq=cs, first_sent_at=0, last_sent_at=0)
-                if not self._send_chunk_data(sending, cs, meta):
-                    break
+                if not self._send_chunk_data(sending, cs, meta): break
                 sending.inflight[cs] = meta
                 sending.next_chunk += 1
                 inflight_bytes += CHUNK_SIZE
+                sent_now += 1
 
     def _pump_loop(self) -> None:
         while self._running:
             time.sleep(0.01)
             now = time.time()
-
             with self._lock:
                 file_ids = list(self._outgoing.keys())
 
             for file_id in file_ids:
                 with self._lock:
                     sending = self._outgoing.get(file_id)
-                    if sending is None or sending.cancelled or not sending.file_info_acked:
-                        continue
-
+                    if sending is None or sending.cancelled or not sending.file_info_acked: continue
                     rto = self._current_rto(sending)
 
                     for meta in list(sending.inflight.values()):
-                        if now - meta.last_sent_at < rto:
-                            continue
+                        if now - meta.last_sent_at < rto: continue
                         if meta.attempts >= MAX_CHUNK_ATTEMPTS:
                             self._outgoing.pop(file_id, None)
                             sending.close_file()
                             if self._on_file_error:
-                                try:
-                                    self._on_file_error(file_id, "Chunk delivery failed (max attempts)")
+                                try: self._on_file_error(file_id, "Chunk delivery failed (max attempts)")
                                 except Exception: pass
                             break
                         meta.attempts += 1
@@ -709,5 +660,4 @@ class FileTransferManager:
                         sending.window_bytes = max(MIN_WINDOW_BYTES, sending.window_bytes // 2)
                         sending.ssthresh = sending.window_bytes
                         sending.in_slow_start = False
-
                 self._kick_window(file_id)

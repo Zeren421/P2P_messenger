@@ -1,13 +1,5 @@
 """
 main_window.py — Main ChatClient window class for the modular P2P chat client.
-
-Изменения относительно предыдущей версии:
-  * _add_file_bubble_to_chat теперь реально добавляет FileBubble в чат
-    (раньше писал только в словарь — bubble не появлялся в UI).
-  * Прогресс, пришедший раньше bubble, применяется при добавлении.
-  * active_file_bubbles / last_file_progress / _file_is_own чистятся
-    при cancel / receive / error / clear_chat — нет зомби-записей.
-  * set_cancel_callback ставится ДО добавления bubble в чат.
 """
 
 import sys
@@ -67,14 +59,15 @@ class ChatClient(QMainWindow):
     # Сигналы
     message_received = pyqtSignal(str, str, datetime)
     typing_signal = pyqtSignal(bool, str)
-    status_signal = pyqtSignal(str, str)  # (text, color)
+    status_signal = pyqtSignal(str, str)
     peer_name_signal = pyqtSignal(str)
     password_retry_signal = pyqtSignal(int)
     file_progress_signal = pyqtSignal(int, float, bool)
     file_error_signal = pyqtSignal(int, str)
-    file_info_signal = pyqtSignal(int, str, object, bytes, str)    # Потокобезопасные сигналы:
+    file_info_signal = pyqtSignal(int, str, int, bytes, str)
     message_failed_signal = pyqtSignal(str)
     file_received_signal = pyqtSignal(int, str, str)
+    file_queued_signal = pyqtSignal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,6 +91,7 @@ class ChatClient(QMainWindow):
         self.last_file_progress = {}
         self._file_is_own = {}
         self._last_progress_ui = {}
+        self.queued_file_ids = set()  # <--- НОВОЕ: храним ID файлов в очереди
         self.last_typing_sent = 0
         self.running = True
         self._loading_history = False
@@ -345,6 +339,7 @@ class ChatClient(QMainWindow):
         self.file_info_signal.connect(self._on_file_info)
         self.message_failed_signal.connect(self._on_message_failed_gui)
         self.file_received_signal.connect(self._on_file_received_gui)
+        self.file_queued_signal.connect(self._on_file_queued_gui)
         log.info("init_signals finished")
 
     # ============================================================
@@ -372,23 +367,25 @@ class ChatClient(QMainWindow):
         return self.conn_manager.send_image_bytes(image_bytes, filename)
 
     def _add_file_bubble_to_chat(self, bubble, is_own):
-        """
-        Добавляет FileBubble в чат и запоминает, чей он (для отмены).
-        Это ЕДИНСТВЕННОЕ место, где FileBubble попадает в chat_layout —
-        и для исходящих (через FileSenderHelper), и для входящих (из _on_file_info).
-        """
         file_id = getattr(bubble, 'file_id', None)
         if file_id is not None:
             self._file_is_own[file_id] = is_own
             self.active_file_bubbles[file_id] = bubble
 
-            # Применяем накопленный прогресс, если он пришёл до bubble
             pending_ratio = self.last_file_progress.pop(file_id, None)
             if pending_ratio is not None:
                 try:
                     bubble.update_progress(pending_ratio)
                 except Exception as e:
                     log.warning(f"_add_file_bubble_to_chat: update_progress error: {e}")
+
+            # Если файл в очереди, сразу показываем плашку
+            if file_id in self.queued_file_ids:
+                self.queued_file_ids.remove(file_id)
+                try:
+                    bubble.set_queued()
+                except Exception as e:
+                    log.warning(f"_add_file_bubble_to_chat: set_queued error: {e}")
 
         align = "right" if is_own else "left"
         self.message_renderer.add_message(bubble, datetime.now(), align)
@@ -414,6 +411,7 @@ class ChatClient(QMainWindow):
             on_file_progress=self._on_file_progress_signal_emitter,
             on_file_error=self._on_file_error_signal_emitter,
             on_file_info=self._on_file_info_callback,
+            on_file_queued=self._on_file_queued_signal_emitter,
         )
         self.conn_manager.set_password(self.password)
         log.info("ConnectionManager created, starting connect thread")
@@ -534,6 +532,9 @@ class ChatClient(QMainWindow):
         log.info(f"_on_file_info_callback: {filename} ({total_size} bytes)")
         self.file_info_signal.emit(file_id, filename, total_size, thumbnail, caption)
 
+    def _on_file_queued_signal_emitter(self, file_id, reason):
+        self.file_queued_signal.emit(file_id, reason)
+
     # ============================================================
     #  Обработчики сигналов (GUI-поток)
     # ============================================================
@@ -550,7 +551,6 @@ class ChatClient(QMainWindow):
         self.add_system_message(f"Не удалось доставить: «{text}»")
 
     def _on_file_progress_gui(self, file_id, ratio, is_outgoing):
-        # Второй рубеж защиты: не чаще 10 раз/с на файл
         now = time.time()
         last = self._last_progress_ui.get(file_id)
         if last is not None:
@@ -577,24 +577,36 @@ class ChatClient(QMainWindow):
         bubble = self.active_file_bubbles.get(file_id)
         if bubble:
             try:
-                bubble.set_progress_done()  # или bubble.set_cancel_callback(None), чтобы скрыть кнопку
+                bubble.set_progress_done()
             except Exception:
                 pass
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
+        self.queued_file_ids.discard(file_id)  # <--- Чистим
+
+    def _on_file_queued_gui(self, file_id, reason):
+        bubble = self.active_file_bubbles.get(file_id)
+        if bubble and hasattr(bubble, 'set_queued'):
+            bubble.set_queued()
+        else:
+            # Если bubble ещё не создан, запоминаем ID
+            self.queued_file_ids.add(file_id)  # <--- Запоминаем
+
     def _on_file_received_gui(self, file_id, filename, save_path):
         self.add_system_message(f"📥 Получен файл: {filename} (сохранён в {save_path})")
         bubble = self.active_file_bubbles.get(file_id)
         if bubble:
             bubble.set_file_path(save_path)
             try:
-                bubble.set_progress_done()  # <--- ПРИНУДИТЕЛЬНО завершаем UI
+                bubble.set_progress_done()
             except Exception as e:
                 log.warning(f"_on_file_received_gui: set_progress_done error: {e}")
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
+        self.queued_file_ids.discard(file_id)  # <--- Чистим
+
     def _on_file_info(self, file_id, filename, total_size, thumbnail, caption):
         log.info(f"_on_file_info: {filename}")
         bubble = FileBubble(
@@ -609,7 +621,7 @@ class ChatClient(QMainWindow):
             parent=self,
             original_bytes=None,
         )
-        bubble.set_cancel_callback(self._on_file_cancel)   # ДО добавления в чат
+        bubble.set_cancel_callback(self._on_file_cancel)
         self._add_file_bubble_to_chat(bubble, is_own=False)
         self.play_notification_sound()
         if not self.isActiveWindow():
@@ -876,6 +888,7 @@ class ChatClient(QMainWindow):
         self.active_file_bubbles.pop(file_id, None)
         self.last_file_progress.pop(file_id, None)
         self._last_progress_ui.pop(file_id, None)
+        self.queued_file_ids.discard(file_id)  # <--- Чистим
         self.add_system_message("❌ Передача файла отменена")
 
     def clear_chat(self):
@@ -897,6 +910,7 @@ class ChatClient(QMainWindow):
             self.last_file_progress.clear()
             self._file_is_own.clear()
             self._last_progress_ui.clear()
+            self.queued_file_ids.clear()  # <--- Чистим
             clear_history()
             self.add_system_message("Чат очищен")
             self.scroll_manager._scroll_to_bottom()

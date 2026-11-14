@@ -409,6 +409,13 @@ class FileBubble(QFrame):
         if not self._completed:
             self._cancel_btn.show()
             
+            # --- ДОБАВИТЬ СБРОС ТЕКСТА ОЧЕРЕДИ ---
+            if self._start_time is None:
+                self._eta_label.setText("") 
+            
+            if self._start_time is None:
+                self._start_time = time.time()
+
             # --- Расчет ETA и скорости ---
             if self._start_time is None:
                 self._start_time = time.time()
@@ -428,6 +435,17 @@ class FileBubble(QFrame):
 
                     self._eta_label.setText(f"{kb_s:.0f} KB/s · осталось {eta_str}")
                     self._eta_label.show()
+
+    def set_queued(self):
+        """Показывает, что файл в очереди (ещё не начал передаваться)."""
+        if self.is_image:
+            if hasattr(self, 'progress_indicator'):
+                self.progress_indicator.hide()
+        else:
+            self.progress_bar.setValue(0)
+        self._eta_label.setText("⏳ В очереди")
+        self._eta_label.show()
+        self._cancel_btn.show()
 
     def set_progress_done(self):
         self._cancel_btn.hide()
