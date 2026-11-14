@@ -1,5 +1,6 @@
 """
-FileTransferManager v2 — с очередью передач и очищенной логикой ACK.
+FileTransferManager v2 — с очередью передач, очищенной логикой ACK
+и разделением папок для файлов и голосовых.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def build_file_info_payload(file_id, filename, total_size, caption, thumbnail) -
     return (
         file_id.to_bytes(4, "big")
         + len(filename_bytes).to_bytes(2, "big") + filename_bytes
-        + total_size.to_bytes(8, "big")  # 8 байт
+        + total_size.to_bytes(8, "big")
         + len(caption_bytes).to_bytes(2, "big") + caption_bytes
         + len(thumbnail).to_bytes(2, "big") + thumbnail
     )
@@ -200,6 +201,7 @@ class FileTransferManager:
         on_file_cancelled: Optional[Callable[[int, bool], None]] = None,
         on_file_queued: Optional[Callable[[int, str], None]] = None,
         downloads_dir: str = ".",
+        voice_dir: Optional[str] = None,   # <--- НОВОЕ
     ) -> None:
         self._send_raw = send_raw
         self._encrypt = encrypt
@@ -213,6 +215,7 @@ class FileTransferManager:
         self._on_file_cancelled = on_file_cancelled
         self._on_file_queued = on_file_queued
         self._downloads_dir = downloads_dir
+        self._voice_dir = voice_dir or downloads_dir   # <--- НОВОЕ
 
         self._lock = threading.Lock()
         self._outgoing: Dict[int, SendingFile] = {}
@@ -426,7 +429,12 @@ class FileTransferManager:
             if file_id in self._incoming: return
 
         safe_name = os.path.basename(filename) or f"file_{file_id}"
-        save_path = self._unique_save_path(safe_name)
+        
+        # Голосовые — в voice/, остальное — в downloads/
+        is_voice = "_voice" in safe_name and safe_name.endswith(".wav")
+        target_dir = self._voice_dir if is_voice else self._downloads_dir
+        save_path = self._unique_save_path(safe_name, target_dir)
+        
         try:
             fh = open(save_path, "w+b")
         except OSError as e:
@@ -559,12 +567,13 @@ class FileTransferManager:
         rto = sending.srtt + 4.0 * sending.rttvar
         return max(RTO_MIN, min(RTO_MAX, rto))
 
-    def _unique_save_path(self, filename: str) -> str:
+    def _unique_save_path(self, filename: str, target_dir: Optional[str] = None) -> str:
         base, ext = os.path.splitext(filename)
-        cand = os.path.join(self._downloads_dir, filename)
+        folder = target_dir or self._downloads_dir
+        cand = os.path.join(folder, filename)
         i = 1
         while os.path.exists(cand):
-            cand = os.path.join(self._downloads_dir, f"{base} ({i}){ext}")
+            cand = os.path.join(folder, f"{base} ({i}){ext}")
             i += 1
         return cand
 
@@ -638,7 +647,7 @@ class FileTransferManager:
                 file_ids = list(self._outgoing.keys())
 
             for file_id in file_ids:
-                freed_slot = False  # <--- НОВЫЙ ФЛАГ
+                freed_slot = False
                 with self._lock:
                     sending = self._outgoing.get(file_id)
                     if sending is None or sending.cancelled or not sending.file_info_acked: 
@@ -656,7 +665,7 @@ class FileTransferManager:
                             if self._on_file_error:
                                 try: self._on_file_error(file_id, "Chunk delivery failed (max attempts)")
                                 except Exception: pass
-                            freed_slot = True  # <--- ФИКС 1: Освободился слот
+                            freed_slot = True
                             break
                             
                         meta.attempts += 1
@@ -666,8 +675,7 @@ class FileTransferManager:
                         sending.ssthresh = sending.window_bytes
                         sending.in_slow_start = False
                 
-                # Вызываем запуск очереди ВНЕ блока с lock, чтобы избежать дедлока
                 if freed_slot:
-                    self._try_start_next_queued()  # <--- ФИКС 1
+                    self._try_start_next_queued()
                     
                 self._kick_window(file_id)

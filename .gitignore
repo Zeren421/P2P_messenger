@@ -14,3 +14,7 @@ peer.txt
 *.mkv
 *.mp4
 p2p_log_*.txt
+voice_*.wav
+# Пользовательские данные
+downloads/
+data/

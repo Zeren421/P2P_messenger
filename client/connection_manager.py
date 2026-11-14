@@ -1,22 +1,14 @@
 """
 ConnectionManager — с надёжной доставкой FILE_INFO, FILE_CANCEL, chunk_seq=4 байта.
 
-Фикс (баг №2):
-  * send_file / send_image_bytes кидают понятную ошибку, если транспорт —
-    не UDP. Relay (ntfy.sh) не тянет файлы: один POST на чанк + rate-limit 429.
-
-Фикс (баг №3):
-  * _handle_file_chunk_ack_bitmap теперь no-op: v2 file_transfer использует
-    кумулятивный ACK, bitmap не поддерживает. Заглушка на случай старого
-    клиента на другой стороне (раньше был AttributeError).
-
-Фикс (очередь файлов):
-  * Добавлен колбэк on_file_queued для отображения статуса "В очереди"
-    в FileBubble (фикс 5).
+Фикс (папки загрузок):
+  * Все принятые файлы складываются в downloads/, голосовые — в downloads/voice/.
+  * Папки создаются автоматически при connect().
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import deque
@@ -68,7 +60,7 @@ class ConnectionManager:
         on_file_progress: Optional[Callable[[int, float, bool], None]] = None,
         on_file_error: Optional[Callable[[int, str], None]] = None,
         on_file_info: Optional[Callable[[int, str, int, bytes, str], None]] = None,
-        on_file_queued: Optional[Callable[[int, str], None]] = None,  # НОВЫЙ КОЛБЭК
+        on_file_queued: Optional[Callable[[int, str], None]] = None,
     ) -> None:
         self._my_topic = my_topic
         self._peer_topic = peer_topic
@@ -162,6 +154,18 @@ class ConnectionManager:
         self._ping_missed = 0
         self.send_pubkey()
 
+        # --- Создаём папки для загрузок ---
+        # connection_manager.py лежит в client/, поэтому поднимаемся на 2 уровня
+        # вверх, чтобы попасть в корень проекта (P2P_Messenger/)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        downloads_root = os.path.join(project_root, "downloads")
+        voice_dir = os.path.join(downloads_root, "voice")
+        os.makedirs(voice_dir, exist_ok=True)
+        print(f"[CM] [INFO] Project root: {project_root}")
+        print(f"[CM] [INFO] Downloads dir: {downloads_root}")
+        print(f"[CM] [INFO] Voice dir: {voice_dir}")
+
+
         self._file_manager = FileTransferManager(
             send_raw=self._send_raw,
             encrypt=lambda data, seq: self._crypto.encrypt(data, seq) if self._crypto else None,
@@ -172,8 +176,9 @@ class ConnectionManager:
             on_file_received=self._on_file_received,
             on_file_error=self._on_file_error,
             on_file_info=self._on_file_info,
-            on_file_queued=self._on_file_queued,  # <--- ПРОКИДЫВАЕМ СЮДА
-            downloads_dir=".",
+            on_file_queued=self._on_file_queued,
+            downloads_dir=downloads_root,
+            voice_dir=voice_dir,   # <--- НОВЫЙ ПАРАМЕТР
         )
         self._file_manager.start()
         return True
@@ -206,7 +211,6 @@ class ConnectionManager:
     # ==========================================================
 
     def _require_udp_for_files(self) -> None:
-        """Общий guard для файловых методов."""
         if not isinstance(self._transport, UdpTransport):
             raise Exception(
                 "Передача файлов доступна только через прямое P2P-соединение (UDP). "
