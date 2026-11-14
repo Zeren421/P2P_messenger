@@ -18,3 +18,4 @@ voice_*.wav
 # Пользовательские данные
 downloads/
 data/
+dist/
